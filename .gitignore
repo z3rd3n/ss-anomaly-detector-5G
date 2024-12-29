@@ -1,0 +1,3 @@
+.tez
+data/scaled_pdsch.parquet
+__pycache__/
