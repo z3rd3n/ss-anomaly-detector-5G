@@ -10,7 +10,7 @@ class Config:
         np.random.seed(self.seed)
 
         self.train = False
-        self.debug = False
+        self.debug = True
         self.seq_len = 32
         self.stride = 32
         self.batch_size = 64

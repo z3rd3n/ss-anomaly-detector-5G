@@ -33,7 +33,7 @@ def train_one_epoch(model, dataloader, optimizer, device,
             rec_loss_scalar = rec_loss.mean()
 
             # Final total loss
-            loss = rec_loss_scalar - lambda_sacon * sacon_mean
+            loss = 2*rec_loss_scalar - lambda_sacon * sacon_mean
 
             optimizer.zero_grad()
 
@@ -91,7 +91,7 @@ def validate_one_epoch(model, dataloader, device, criterion_mse, span, one_side,
             sacon_mean = sacon_all_layers.mean()
 
             # total loss
-            loss_val = rec_loss - lambda_sacon * sacon_mean
+            loss_val = 2*rec_loss - lambda_sacon * sacon_mean
 
             total_rec_loss += rec_loss.item()
             total_loss += loss_val.item()

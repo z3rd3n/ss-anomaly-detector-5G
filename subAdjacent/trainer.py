@@ -4,6 +4,7 @@ import torch
 from subAdjacent.run_epoch import train_one_epoch, validate_one_epoch
 from utils import *
 from tqdm import tqdm
+# import softm
 
 
 def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
@@ -76,76 +77,56 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
     logging.info("Training finished.")
 
 
-
 def detect_anomalies(params, model, optimizer, val_loader):
-
     load_last_checkpoint(params, model, optimizer)
     
+    model.eval()
     all_scores = []
-    all_rec = []
-    all_sacon = []
     all_features = []
     all_timestamps = []
-
     criterion_mse = torch.nn.MSELoss(reduction='none')
+    softmax = torch.nn.Softmax(dim=-1)
 
-    model.eval()
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(val_loader, desc="Detecting anomalies")):
-            if params.debug and i >= 50:
-                break
+        train_energy = []
+        for batch in tqdm(val_loader, desc="Detecting anomalies"):
             features = batch['features'].to(params.device)
-            timestamps_list = batch['timestamps']
-
+            timestamps = batch['timestamps']
+            
+            # Get model outputs
             enc_out, queries_list, keys_list = model(features)
-            # rec_loss shape = [B, seq_len, D], we reduce feature-dim => [B, seq_len]
-            rec_loss = criterion_mse(enc_out, features).mean(dim=-1) #it means over features
+            
+            # Per-window reconstruction loss 
+            rec_loss = criterion_mse(enc_out, features).mean(dim=-1)
+            loss_attn = 0.0
+            # Calculate SACon from all layers
+            for q, k in zip(queries_list, keys_list):
+                loss_attn += model.compute_sub_adj_contrib(q, k, params.span, params.one_side)
+            loss_attn /= len(queries_list)
+            
+            train_score = softmax(-loss_attn) * rec_loss
+            train_energy.append(train_score.cpu().numpy())
+            all_features.append(features.cpu().numpy())
+            all_timestamps.extend([t for sublist in timestamps for t in sublist])
 
-            # SACon (averaged across layers)
-            sacon_all_layers = torch.zeros_like(rec_loss)
-            for (q, k_) in zip(queries_list, keys_list):
-                sacon_all_layers += model.compute_sub_adj_contrib(q, k_, params.span, params.one_side)
-            sacon_all_layers /= len(queries_list)
-
-            # flatten
-            rec_loss_flat = rec_loss.view(-1).cpu().numpy() # shape [B,L] => [B*L]
-            sacon_flat = sacon_all_layers.view(-1).cpu().numpy() # shape [B,L] => [B*L]
-
-            # store
-            all_rec.append(rec_loss_flat)
-            all_sacon.append(sacon_flat)
-            all_features.append(features.view(-1, features.shape[-1]).cpu().numpy())
-            all_timestamps.extend([t for sublist in timestamps_list for t in sublist])
-
-    # concat
-    all_rec = np.concatenate(all_rec, axis=0)
-    all_sacon = np.concatenate(all_sacon, axis=0)
-    all_features = np.concatenate(all_features, axis=0)
-
-    # anomaly_score = rec_loss * softmax(-sacon)
-    # We'll do a single global softmax across all points for simplicity:
-    negative_sacon = -all_sacon
-    # be mindful of big shape => do it with stable code
-    sacon_weights = np.exp(negative_sacon - negative_sacon.max())
-    sacon_weights /= (sacon_weights.sum() + 1e-6)
-
-    all_scores = all_rec * sacon_weights  # multiply elementwise
-
-    # threshold
-    threshold = calculate_threshold_evt(all_scores)
-    anomalies_mask = (all_scores > threshold)
-
-    # Save to CSV (unscale -> int)
+    train_attn_array = np.concatenate(train_energy, axis=0).reshape(-1)
+    all_features = np.concatenate(all_features, axis=0).reshape(-1, len(params.feature_columns))
+   
+    # Calculate threshold using EVT
+    threshold = calculate_threshold_evt(train_attn_array)
+    anomalies_mask = train_attn_array > threshold
+    
+    # Save results
     unscale_and_save_anomalies(
         timestamps=all_timestamps,
         features=all_features,
-        anomaly_scores=all_scores,
+        anomaly_scores=train_attn_array,
         threshold=threshold,
         output_csv=os.path.join(params.output_dir, "detected_anomalies.csv")
     )
 
-    # Plot
-    plot_anomalies(all_scores, anomalies_mask, threshold, params.output_dir)
+    # Visualizations
+    plot_anomalies(train_attn_array, anomalies_mask, threshold, params.output_dir)
     plot_attention_matrices(model, val_loader, params.device, params.output_dir)
-
+    
     logging.info("Anomaly detection complete.")
