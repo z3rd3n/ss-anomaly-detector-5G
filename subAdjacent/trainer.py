@@ -39,7 +39,8 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
             criterion_mse,
             params.span,
             params.one_side,
-            lambda_sacon=params.k_value  # or some param name
+            lambda_sacon=params.k_value,  # or some param name
+            max_grad_norm=params.max_grad_norm
         )
         val_rec_loss, val_total_loss = validate_one_epoch(
             model,

@@ -10,9 +10,9 @@ class Config:
         np.random.seed(self.seed)
 
         self.train = False
-        self.debug = True
+        self.debug = False
         self.seq_len = 32
-        self.stride = 32
+        self.stride = None
         self.batch_size = 64
         self.num_epochs = 50
         self.validation_ratio=0.2
@@ -42,6 +42,7 @@ class Config:
         self.dropout = 0.1
         self.span = [4,8]
         self.one_side = False
+        self.max_grad_norm = 5.0
 
         # Training specific params
         self.shuffle_files = True

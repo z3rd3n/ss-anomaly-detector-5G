@@ -4,7 +4,7 @@ from tqdm import tqdm
 import logging
 
 def train_one_epoch(model, dataloader, optimizer, device, 
-                    criterion_mse, span, one_side, lambda_sacon=0.1):
+                    criterion_mse, span, one_side, lambda_sacon=0.1, max_grad_norm=1.0):
     """
     Changes:
       - total_loss = rec_loss - lambda_sacon * sacon_loss
@@ -17,29 +17,29 @@ def train_one_epoch(model, dataloader, optimizer, device,
     train_pbar = tqdm(dataloader, desc="Training", total=len(dataloader))
     for batch_idx, batch in enumerate(train_pbar):
         features = batch['features'].to(device)  # [B, seq_len, D]
-        with torch.autograd.set_detect_anomaly(True):
-            enc_out, queries_list, keys_list = model(features)
 
-            # Reconstruction loss
-            rec_loss = criterion_mse(enc_out, features) # shape [B, seq_len, D]
+        enc_out, queries_list, keys_list = model(features)
 
-            sacon_all_layers = 0.0
-            for (q, k_) in zip(queries_list, keys_list): # e_layers times
-                sacon_all_layers += model.compute_sub_adj_contrib(q, k_, span, one_side)
-            sacon_all_layers /= len(queries_list)  # shape [B, L]
+        # Reconstruction loss
+        rec_loss = criterion_mse(enc_out, features) # shape [B, seq_len, D]
 
-            sacon_mean = sacon_all_layers.mean() 
+        sacon_all_layers = 0.0
+        for (q, k_) in zip(queries_list, keys_list): # e_layers times
+            sacon_all_layers += model.compute_sub_adj_contrib(q, k_, span, one_side)
+        sacon_all_layers /= len(queries_list)  # shape [B, L]
 
-            rec_loss_scalar = rec_loss.mean()
+        sacon_mean = sacon_all_layers.mean() 
 
-            # Final total loss
-            loss = 2*rec_loss_scalar - lambda_sacon * sacon_mean
+        rec_loss_scalar = rec_loss.mean()
 
-            optimizer.zero_grad()
+        # Final total loss
+        loss = 2*rec_loss_scalar - lambda_sacon * sacon_mean
 
-            loss.backward()
+        optimizer.zero_grad()
+
+        loss.backward()
         
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
 
         total_loss += loss.item()
