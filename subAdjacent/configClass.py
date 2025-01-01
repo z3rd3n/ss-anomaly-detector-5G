@@ -9,16 +9,16 @@ class Config:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        self.train = True
+        self.train = False
         self.detect = True
         self.seq_len = 32
         self.stride = None
         self.batch_size = 128
-        self.num_epochs = 10
+        self.num_epochs = 15
         self.validation_ratio=0.2
         self.learning_rate = 1e-4
 
-        self.optimizer_name = 'Adam'
+        self.optimizer_name = 'AdamW'
         self.weight_decay = 6e-5
 
         self.feature_columns = [
@@ -26,7 +26,7 @@ class Config:
         ]
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.checkpoint_path = 'subAdjacent/results/checkpoint_epoch_5.pt'  # Path to load checkpoint from
+        self.checkpoint_path = None  # Path to load checkpoint from
 
         # Directories
         self.parquet_path = "data/scaled_pdsch.parquet"

@@ -17,7 +17,7 @@ def start_logging(params=None, approach=None):
     if params is None and approach is None:
         output_dir = 'results'
     else:
-        experiment_name = f"T{1 if params.train else 0}_D{1 if params.detect else 0}_q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
+        experiment_name = f"q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
         output_dir = os.path.join(output_dir, experiment_name)
         params.output_dir = output_dir
 
@@ -44,36 +44,38 @@ def start_logging(params=None, approach=None):
 
 
 def save_checkpoint(model, optimizer, epoch, loss, params):
+    # Define the checkpoint directory and ensure it exists
     checkpoint_dir = os.path.join(params.output_dir, 'checkpoints')
-    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_best.pt')
-    torch.save({
+    os.makedirs(checkpoint_dir, exist_ok=True)  # Creates the directory if it doesn't exist
+
+    # Define the checkpoint file path
+    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
+
+    # Prepare the checkpoint dictionary
+    checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
-    }, checkpoint_path)
+        'optimizer_name': type(optimizer).__name__,  # Logging optimizer's class name
+    }
+
+    # Save the checkpoint
+    torch.save(checkpoint, checkpoint_path)
     logging.info(f"Checkpoint saved: {checkpoint_path}")
+    logging.info(f"Optimizer used: {checkpoint['optimizer_name']}")
+    logging.info(f"Epoch: {epoch}, Loss: {loss:.4f}")
 
-def load_last_checkpoint(params, model, optimizer):
-    checkpoint_dir = os.path.join(params.output_dir, 'checkpoints')
-    result_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
-    if not result_files:
-        logging.info(f"No checkpoints found in {checkpoint_dir}, aborting detection.")
-        return
-
-    def get_epoch(fname):
-        return int(fname.split('_')[-1].replace('.pt',''))
-    result_files_sorted = sorted(result_files, key=lambda x: get_epoch(x))
-    last_ckpt = os.path.join(checkpoint_dir, result_files_sorted[-1])
-    logging.info(f"Loading last checkpoint: {last_ckpt}")
-
-    epoch, loss = load_checkpoint(model, optimizer, last_ckpt)
-    logging.info(f"Loaded last checkpoint from epoch {epoch+1} with loss {loss:.4f}")
+    if hasattr(params, 'learning_rate'):
+        logging.info(f"Learning Rate: {params.learning_rate}")
 
 
-def load_checkpoint(model, optimizer, checkpoint_path):
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
+def load_checkpoint(model, optimizer, output_dir):
+    checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)  # Creates the directory if it doesn't exist
+
+    # Define the checkpoint file path
+    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
 
     device = next(model.parameters()).device
     checkpoint = torch.load(checkpoint_path, map_location=device)

@@ -22,16 +22,16 @@ def objective(trial: optuna.trial.Trial) -> float:
     # 1. Create a fresh config
     config = Config()
     config.train = True  # We do want to train in these trials
-    config.num_epochs = 1  # Fewer epochs for faster search
+    config.num_epochs = 5  # Fewer epochs for faster search
 
     # 2. Suggest hyperparameters
     # Here are examples; you can add or remove based on your needs:
     #config.learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True)
     #config.dropout       = trial.suggest_float("dropout", 0.0, 0.2, step=0.05)
-    #config.model_dim     = trial.suggest_categorical("model_dim", [32, 64, 128, 256])
-    #config.n_heads       = trial.suggest_categorical("n_heads", [2, 4, 8])
-    #config.e_layers      = trial.suggest_int("e_layers", 2, 8)
-    #config.k_value       = trial.suggest_float("k_value", 0.01, 2.0, log=True)
+    config.model_dim     = trial.suggest_categorical("model_dim", [128, 256, 512, 1024])
+    config.n_heads       = trial.suggest_categorical("n_heads", [2, 4, 8, 12])
+    config.e_layers      = trial.suggest_int("e_layers", 2, 8)
+    config.k_value       = trial.suggest_float("k_value", 0.01, 2.0, log=True)
     config.one_side      = trial.suggest_categorical("one_side", [True, False])
     #config.batch_size    = trial.suggest_categorical("batch_size", [32, 64, 128])
     config.seq_len       = trial.suggest_categorical("seq_len", [16, 32, 50, 64, 100])
@@ -76,11 +76,11 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 
     if len(train_dataset.file_ids) > 10:
-        train_dataset.file_ids = train_dataset.file_ids[:1]
+        train_dataset.file_ids = train_dataset.file_ids[:10]
         train_dataset.num_files = len(train_dataset.file_ids)
 
     if len(val_dataset.file_ids) > 2:
-        val_dataset.file_ids = val_dataset.file_ids[:1]
+        val_dataset.file_ids = val_dataset.file_ids[:5]
         val_dataset.num_files = len(val_dataset.file_ids)
 
     # 5. Create DataLoaders

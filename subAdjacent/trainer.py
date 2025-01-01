@@ -20,7 +20,7 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
     # 4) training
     best_val_loss = float('inf')
     not_improved_count = 0
-    early_stop_patience = 5
+    early_stop_patience = 3
 
     all_train_losses = []
     all_val_losses = []
@@ -77,7 +77,7 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
 
 
 def detect_anomalies(params, model, optimizer, val_loader):
-    load_last_checkpoint(params, model, optimizer)
+    load_checkpoint(model, optimizer, params.output_dir)
     
     model.eval()
     all_preds= []
@@ -121,7 +121,7 @@ def detect_anomalies(params, model, optimizer, val_loader):
     unscale_and_save_anomalies(
         timestamps=all_timestamps,
         features=all_features,
-        predictions=all_preds,
+        enc_outputs=all_preds,
         anomaly_scores=train_attn_array,
         threshold=threshold,
         output_csv=os.path.join(params.output_dir, "detected_anomalies.csv")
