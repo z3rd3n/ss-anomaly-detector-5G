@@ -10,12 +10,14 @@ from scipy import stats
 import pandas as pd
 
 
-def start_logging(params):
+def start_logging(output_dir='results'):
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(params.output_dir, 'logs')
+    script_dir = os.path.dirname(__file__)
+    dir = os.path.join(script_dir, output_dir)
+    log_dir = os.path.join(dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'logTraining_{current_time}.log')
     logging.basicConfig(

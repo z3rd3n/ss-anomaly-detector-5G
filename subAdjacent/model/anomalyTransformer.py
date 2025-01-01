@@ -104,9 +104,7 @@ class AnomalyTransformer(nn.Module):
         # compute attention matrix
         attnMatrix = torch.einsum("b l h e, b s h e -> b h l s", q, k)
         den = attnMatrix.sum(dim=-1, keepdim=True)
-        if (den <= 1e-12).any():
-            print("attnMatrix min/max:", attnMatrix.min().item(), attnMatrix.max().item())
-        den = den.clamp(min=1e-8)
+        den = den.clamp(min=1e-6)
         attnMatrix = attnMatrix / den
 
 

@@ -18,6 +18,8 @@ class Config:
         self.validation_ratio=0.2
         self.learning_rate = 1e-4
         self.pretrain= None
+        self.optimizer_name = 'Adam'
+        self.weight_decay = 1e-6
 
         self.feature_columns = [
             'SFN', 'Slot', 'CC', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI',
@@ -38,7 +40,7 @@ class Config:
         self.n_heads = 8          # number of attention heads
         self.e_layers = 3         # number of encoder layers
         self.activation = 'gelu'  # activation function
-        self.k_value = 0.1        # trade-off parameter for loss
+        self.k_value = 0.5        # trade-off parameter for loss
         self.dropout = 0.1
         self.span = [4,8]
         self.one_side = False

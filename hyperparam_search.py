@@ -2,8 +2,7 @@
 
 import optuna
 import logging
-import numpy as np
-import time
+from utils import start_logging
 
 # For Optuna plotting
 import optuna.visualization.matplotlib as optuna_plot
@@ -12,36 +11,11 @@ import os
 
 # Import your existing code
 from subAdjacent.configClass import Config
-from subAdjacent.trainer import train_model
 from data.dataLoader import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-class TimeEstimationCallback:
-    def __init__(self, n_trials: int):
-        self.start_time = None
-        self.n_trials = n_trials
-
-    def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
-        # If this is the first trial, initialize start_time
-        if self.start_time is None:
-            self.start_time = time.time()
-
-        completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-        elapsed_time = time.time() - self.start_time
-
-        # Only estimate time if at least 1 trial has completed
-        if completed_trials > 0:
-            average_time_per_trial = elapsed_time / completed_trials
-            remaining_trials = self.n_trials - completed_trials
-            eta = average_time_per_trial * remaining_trials
-
-            print(
-                f"Completed Trials: {completed_trials}/{self.n_trials} | "
-                f"Elapsed: {elapsed_time:.2f}s | "
-                f"ETA: {eta:.2f}s"
-            )
 
 def objective(trial: optuna.trial.Trial) -> float:
     """
@@ -52,27 +26,29 @@ def objective(trial: optuna.trial.Trial) -> float:
     # 1. Create a fresh config
     config = Config()
     config.train = True  # We do want to train in these trials
-    config.num_epochs = 5  # Fewer epochs for faster search
+    config.num_epochs = 2  # Fewer epochs for faster search
 
     # 2. Suggest hyperparameters
     # Here are examples; you can add or remove based on your needs:
-    config.learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True)
-    config.dropout       = trial.suggest_float("dropout", 0.0, 0.3, step=0.1)
-    config.model_dim     = trial.suggest_categorical("model_dim", [32, 64, 128, 256])
-    config.n_heads       = trial.suggest_categorical("n_heads", [2, 4, 8])
-    config.e_layers      = trial.suggest_int("e_layers", 1, 4)
-    config.k_value       = trial.suggest_float("k_value", 0.01, 1.0, log=True)
+    #config.learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True)
+    #config.dropout       = trial.suggest_float("dropout", 0.0, 0.2, step=0.05)
+    #config.model_dim     = trial.suggest_categorical("model_dim", [32, 64, 128, 256])
+    #config.n_heads       = trial.suggest_categorical("n_heads", [2, 4, 8])
+    #config.e_layers      = trial.suggest_int("e_layers", 2, 8)
+    #config.k_value       = trial.suggest_float("k_value", 0.01, 2.0, log=True)
     config.one_side      = trial.suggest_categorical("one_side", [True, False])
-    config.batch_size    = trial.suggest_categorical("batch_size", [32, 64, 128])
-    config.seq_len       = trial.suggest_categorical("seq_len", [8, 16, 32, 50, 64, 100])
-    config.activation    = trial.suggest_categorical("activation", ['relu', 'gelu'])
-    config.max_grad_norm = trial.suggest_float("max_grad_norm", 1.0, 10.0)
+    #config.batch_size    = trial.suggest_categorical("batch_size", [32, 64, 128])
+    config.seq_len       = trial.suggest_categorical("seq_len", [16, 32, 50, 64, 100])
+    #config.activation    = trial.suggest_categorical("activation", ['relu', 'gelu'])
 
 
     span_ratio_pairs = {
     "low_1/16_high_1/8": (1.0/16, 1.0/8),
     "low_1/8_high_1/4": (1.0/8, 1.0/4),
     "low_1/4_high_1/2": (1.0/4, 1.0/2),
+    "low_1/2_high_3/4": (1.0/2, 3.0/4),
+    "low_3/4_high_7/8": (3.0/4, 7.0/8),
+    "low_1/8_high_3/8": (1.0/8, 3.0/8),
     # etc. add more if you want
     }
 
@@ -90,8 +66,8 @@ def objective(trial: optuna.trial.Trial) -> float:
     config.span = (span_low, span_high)
 
     
-    optimizer_name       = trial.suggest_categorical("optimizer_name", ["Adam", "AdamW", "SGD"])
-    weight_decay         = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    #optimizer_name       = trial.suggest_categorical("optimizer_name", ["Adam", "AdamW", "SGD"])
+    #weight_decay         = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
 
     train_dataset, val_dataset = ParquetSequenceDataset.create_train_val_splits(
         parquet_path=config.parquet_path,
@@ -104,11 +80,11 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 
     if len(train_dataset.file_ids) > 10:
-        train_dataset.file_ids = train_dataset.file_ids[:10]
+        train_dataset.file_ids = train_dataset.file_ids[:25]
         train_dataset.num_files = len(train_dataset.file_ids)
 
     if len(val_dataset.file_ids) > 2:
-        val_dataset.file_ids = val_dataset.file_ids[:3]
+        val_dataset.file_ids = val_dataset.file_ids[:5]
         val_dataset.num_files = len(val_dataset.file_ids)
 
     # 5. Create DataLoaders
@@ -133,12 +109,12 @@ def objective(trial: optuna.trial.Trial) -> float:
     model = config.build_model()
 
     # 7. Choose optimizer based on the suggestion
-    if optimizer_name == "Adam":
-        optimizer = optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=weight_decay)
-    elif optimizer_name == "AdamW":
-        optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=weight_decay)
+    if config.optimizer_name == "Adam":
+        optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+    elif config.optimizer_name == "AdamW":
+        optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     else:  # SGD
-        optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, weight_decay=weight_decay, momentum=0.9)
+        optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay, momentum=0.9)
 
     # 8. Optionally set up a scheduler
     scheduler = ReduceLROnPlateau(
@@ -200,12 +176,13 @@ def run_training_for_trial(config, model, optimizer, scheduler, train_loader, va
 
 
 def main():
+    start_logging()
     optuna.samplers.TPESampler(seed=42)
     study = optuna.create_study(direction='minimize')  # Minimizing validation loss
     study.optimize(
         objective,
-        n_trials=20,
-        callbacks=[TimeEstimationCallback(20)]
+        n_trials=25,
+        show_progress_bar=True,
     )
 
     logging.info("Hyperparameter search complete.")

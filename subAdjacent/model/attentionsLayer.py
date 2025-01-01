@@ -24,8 +24,8 @@ class LinearAnomalyAttention(nn.Module):
         keys: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        queries[queries < 0] = -10
-        keys[keys < 0] = -10
+        queries[queries < 0] = -100
+        keys[keys < 0] = -100
         delta = nn.Softplus()(self.delta1)
         queries = self.softmax(queries / delta)
         keys = self.softmax(keys / delta)
@@ -41,14 +41,7 @@ class LinearAnomalyAttention(nn.Module):
         """Forward pass of the linear attention mechanism."""
         
         queries, keys = self._apply_mapping(queries, keys)
-        
-        sum_q = queries.isnan().any() or queries.isinf().any()
-        sum_k = keys.isnan().any() or keys.isinf().any()
-        if sum_q or sum_k:
-            print("NaN/Inf found in queries/keys!")
-            print("queries min/max:", queries.min(), queries.max())
-            print("keys min/max:", keys.min(), keys.max())
-        
+                
         kv = torch.einsum("b e h l, b l h f -> b h e f", keys.transpose(1, 3), values)
 
         z = 1 / (torch.einsum("b l h e, b h e -> b l h", queries, keys.sum(dim=1)) + 1e-6)

@@ -9,7 +9,7 @@ import argparse
 import logging
 
 def main(params, train_func, detect_func):    
-    start_logging(params)
+    start_logging(params.output_dir)
 
     logging.info("Building model...")
     model = params.build_model()

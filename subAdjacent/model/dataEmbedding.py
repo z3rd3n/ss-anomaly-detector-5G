@@ -74,8 +74,6 @@ class DataEmbedding(nn.Module):
         self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
         self.position_embedding = PositionalEmbedding(d_model=d_model)
 
-        self.dropout = nn.Dropout(p=dropout)
-
     def forward(self, x):
         x = self.value_embedding(x) + self.position_embedding(x)
-        return self.dropout(x)
+        return x
