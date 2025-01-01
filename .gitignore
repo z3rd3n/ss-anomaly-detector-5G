@@ -2,7 +2,6 @@
 data/scaled_pdsch.parquet
 __pycache__/
 reportable/
-*.whl
 prompt.py
 subAdjacent/results/
 results/
