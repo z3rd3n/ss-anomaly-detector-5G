@@ -25,13 +25,14 @@ def objective(trial: optuna.trial.Trial) -> float:
     # 2. Suggest hyperparameters
     config.learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True)
     config.dropout = trial.suggest_float("dropout", 0.0, 0.5, step=0.05)
-    config.model_dim = trial.suggest_categorical("model_dim", [64, 128, 256, 512, 1024])
-    config.n_heads = trial.suggest_categorical("n_heads", [2, 4, 8, 16])
-    config.e_layers = trial.suggest_int("e_layers", 1, 12)
-    config.k_value = trial.suggest_float("k_value", 0.1, 10.0, log=True)
+    config.model_dim = trial.suggest_categorical("model_dim", [128, 256, 512, 1024])
+    config.n_heads = trial.suggest_categorical("n_heads", [2, 4, 8, 12, 16])
+    config.e_layers = trial.suggest_int("e_layers", 4, 12)
+    config.k_value = trial.suggest_float("k_value", 0.1, 20.0, log=True)
     config.one_side = trial.suggest_categorical("one_side", [True, False])
-    config.seq_len = trial.suggest_int("seq_len", 20, 200, step=10)
-    config.activation = trial.suggest_categorical("activation", ['relu', 'gelu', 'tanh'])
+    config.negative_qk = trial.suggest_categorical("negative_qk", [True, False])
+    config.seq_len = trial.suggest_int("seq_len", 20, 200, step=5)
+    config.activation = trial.suggest_categorical("activation", ['relu', 'gelu'])
 
     stride_ratio_pairs = {
         "1/8": 1.0/8,
@@ -137,6 +138,7 @@ def run_training_for_trial(config, model, optimizer, scheduler, train_loader, va
             criterion_mse,
             config.span,
             config.one_side,
+            lamda_rec=config.lamda_rec,
             lambda_sacon=config.k_value,
             max_grad_norm=config.max_grad_norm
         )
@@ -148,6 +150,7 @@ def run_training_for_trial(config, model, optimizer, scheduler, train_loader, va
             criterion_mse,
             config.span,
             config.one_side,
+            lamda_rec=config.lamda_rec,
             lambda_sacon=config.k_value
         )
 

@@ -37,6 +37,7 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
             criterion_mse,
             params.span,
             params.one_side,
+            lamda_rec=params.lamda_rec,
             lambda_sacon=params.k_value,  # or some param name
             max_grad_norm=params.max_grad_norm
         )
@@ -47,6 +48,7 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
             criterion_mse,
             params.span,
             params.one_side,
+            lamda_rec=params.lamda_rec,
             lambda_sacon=params.k_value
         )
 

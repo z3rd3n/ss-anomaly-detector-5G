@@ -10,8 +10,10 @@ class LinearAnomalyAttention(nn.Module):
         self,
         dropout: float = 0.0,
         output_attention: bool = False,
+        negative_qk : bool = False
     ):
         super().__init__()
+        self.negative_qk = negative_qk
         self.output_attention = output_attention
         self.dropout = nn.Dropout(dropout)
         
@@ -24,8 +26,9 @@ class LinearAnomalyAttention(nn.Module):
         keys: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        queries[queries < 0] = -100
-        keys[keys < 0] = -100
+        if not self.negative_qk:
+            queries[queries < 0] = -100
+            keys[keys < 0] = -100
         delta = nn.Softplus()(self.delta1)
         queries = self.softmax(queries / delta)
         keys = self.softmax(keys / delta)

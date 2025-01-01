@@ -41,10 +41,12 @@ def main(params, train_func, detect_func):
     )
 
     logging.info("Initializing optimizer and scheduler...")
-    if params.optimizer_name == 'Adam':
-        optimizer = optim.AdamW(model.parameters(), lr=params.learning_rate)
-    if params.optimizer_name == 'AdamW':
+    if params.optimizer_name == "Adam":
+        optimizer = optim.Adam(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
+    elif params.optimizer_name == "AdamW":
         optimizer = optim.AdamW(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
+    else:  # SGD
+        optimizer = optim.SGD(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay, momentum=0.9)
 
     scheduler = ReduceLROnPlateau(
         optimizer,

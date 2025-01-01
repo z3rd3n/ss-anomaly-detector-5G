@@ -41,6 +41,8 @@ class Config:
         self.e_layers = 4         # number of encoder layers
         self.activation = 'gelu'  # activation function
         self.k_value = 2        # trade-off parameter for loss
+        self.lamda_rec = 2
+        self.negative_qk = False
         self.dropout = 0.15
         self.span = [4,12]
         self.one_side = False
@@ -69,5 +71,6 @@ class Config:
             dropout=self.dropout,
             activation=self.activation,
             output_attention=self.output_attention,
+            negative_qk=self.negative_qk
         ).to(self.device)
         return model

@@ -4,7 +4,7 @@ from tqdm import tqdm
 import logging
 
 def train_one_epoch(model, dataloader, optimizer, device, 
-                    criterion_mse, span, one_side, lambda_sacon=0.1, max_grad_norm=1.0):
+                    criterion_mse, span, one_side,lamda_rec=2, lambda_sacon=10, max_grad_norm=1.0):
     """
     Changes:
       - total_loss = rec_loss - lambda_sacon * sacon_loss
@@ -33,7 +33,7 @@ def train_one_epoch(model, dataloader, optimizer, device,
         rec_loss_scalar = rec_loss.mean()
 
         # Final total loss
-        loss = 2*rec_loss_scalar - lambda_sacon * sacon_mean
+        loss = lamda_rec*rec_loss_scalar - lambda_sacon * sacon_mean
 
         optimizer.zero_grad()
 
@@ -45,15 +45,6 @@ def train_one_epoch(model, dataloader, optimizer, device,
         total_loss += loss.item()
         batch_count += 1
 
-        # Logging
-        if (batch_idx + 1) % 5000 == 0:
-            logging.info(
-                f"Batch {batch_idx+1} => "
-                f"RecLoss: {rec_loss_scalar.item():.4f}, "
-                f"SACon: {sacon_mean.item():.4f}, "
-                f"TotalLoss: {loss.item():.4f}"
-            )
-
         train_pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
             'rec': f"{rec_loss_scalar.item():.4f}",
@@ -64,7 +55,7 @@ def train_one_epoch(model, dataloader, optimizer, device,
     return avg_loss
 
 
-def validate_one_epoch(model, dataloader, device, criterion_mse, span, one_side, lambda_sacon=10.0):
+def validate_one_epoch(model, dataloader, device, criterion_mse, span, one_side,lamda_rec=2, lambda_sacon=10.0):
     """
     Validation with the same objective. We return just the rec_loss or total_loss
     for logging.
@@ -91,7 +82,7 @@ def validate_one_epoch(model, dataloader, device, criterion_mse, span, one_side,
             sacon_mean = sacon_all_layers.mean()
 
             # total loss
-            loss_val = 2*rec_loss - lambda_sacon * sacon_mean
+            loss_val = lamda_rec*rec_loss - lambda_sacon * sacon_mean
 
             total_rec_loss += rec_loss.item()
             total_loss += loss_val.item()

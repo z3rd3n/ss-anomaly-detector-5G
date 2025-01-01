@@ -52,7 +52,7 @@ class Encoder(nn.Module):
 
 class AnomalyTransformer(nn.Module):
     def __init__(self, enc_in, c_out, d_model=512, n_heads=8, e_layers=3,
-                 dropout=0.0, activation='gelu', output_attention=True):
+                 dropout=0.0, activation='gelu', output_attention=True, negative_qk=False):
         super(AnomalyTransformer, self).__init__()
         self.output_attention = output_attention
 
@@ -65,6 +65,7 @@ class AnomalyTransformer(nn.Module):
                 LinearAnomalyAttention(
                 dropout=dropout, 
                 output_attention=output_attention, 
+                negative_qk=negative_qk
                 ),
                 d_model, 
                 n_heads
