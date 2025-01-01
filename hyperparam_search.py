@@ -10,6 +10,7 @@ from data.dataLoader import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch
 
 def objective(trial: optuna.trial.Trial) -> float:
     """
@@ -17,10 +18,11 @@ def objective(trial: optuna.trial.Trial) -> float:
     It will set different hyperparams on the Config, run training on
     a small subset of data, and return the validation loss.
     """
+    torch.cuda.empty_cache()
     # 1. Create a fresh config
     config = Config()
     config.train = True  # We do want to train in these trials
-    config.num_epochs = 10  # Increased epochs for better convergence
+    config.num_epochs = 1  # Increased epochs for better convergence
 
     # 2. Suggest hyperparameters
     config.learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True)
@@ -31,19 +33,8 @@ def objective(trial: optuna.trial.Trial) -> float:
     config.k_value = trial.suggest_float("k_value", 0.1, 20.0, log=True)
     config.one_side = trial.suggest_categorical("one_side", [True, False])
     config.negative_qk = trial.suggest_categorical("negative_qk", [True, False])
-    config.seq_len = trial.suggest_int("seq_len", 20, 200, step=5)
+    config.seq_len = trial.suggest_int("seq_len", 20, 100, step=5)
     config.activation = trial.suggest_categorical("activation", ['relu', 'gelu'])
-
-    stride_ratio_pairs = {
-        "1/8": 1.0/8,
-        "1/4": 1.0/4,
-        "1/2": 1.0/2,
-        "3/4": 3.0/4,
-        "full": 1.0  # Non-overlapping
-    }
-    chosen_stride_key = trial.suggest_categorical("stride_ratio_key", list(stride_ratio_pairs.keys()))
-    stride_ratio = stride_ratio_pairs[chosen_stride_key]
-    config.stride = max(1, int(config.seq_len * stride_ratio))
 
     span_ratio_pairs = {
         "low_1/16_high_1/8": (1.0/16, 1.0/8),
@@ -64,7 +55,7 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     config.optimizer_name = trial.suggest_categorical("optimizer_name", ["Adam", "AdamW", "SGD"])
     config.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-    config.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+    config.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
     train_dataset, val_dataset = ParquetSequenceDataset.create_train_val_splits(
         parquet_path=config.parquet_path,
@@ -77,12 +68,12 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     # Optionally limit the dataset size for faster trials
     # Remove or adjust if computational resources allow
-    if len(train_dataset.file_ids) > 50:
-        train_dataset.file_ids = train_dataset.file_ids[:30]
+    if len(train_dataset.file_ids) > 1:
+        train_dataset.file_ids = train_dataset.file_ids[:2]
         train_dataset.num_files = len(train_dataset.file_ids)
 
-    if len(val_dataset.file_ids) > 10:
-        val_dataset.file_ids = val_dataset.file_ids[:10]
+    if len(val_dataset.file_ids) > 1:
+        val_dataset.file_ids = val_dataset.file_ids[:1]
         val_dataset.num_files = len(val_dataset.file_ids)
 
     train_loader = DataLoader(
@@ -120,6 +111,9 @@ def objective(trial: optuna.trial.Trial) -> float:
     )
 
     best_val_loss = run_training_for_trial(config, model, optimizer, scheduler, train_loader, val_loader)
+    
+    del model
+    torch.cuda.empty_cache()
     return best_val_loss
 
 def run_training_for_trial(config, model, optimizer, scheduler, train_loader, val_loader):
@@ -182,6 +176,7 @@ def main():
         objective,
         n_trials=30,  # Increased number of trials
         show_progress_bar=True,
+        gc_after_trial=True
     )
     
     logging.info("\n=== Optuna Dashboard Instructions ===")

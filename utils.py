@@ -291,7 +291,10 @@ def unscale_and_save_anomalies(
 
     logging.info(f"Anomalies saved to CSV => {output_csv}")
 
-
+def count_trainable_parameters(model):
+    """Count the number of trainable parameters in the model"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
 def calculate_threshold_evt(scores, q=0.99, p=95):
     # Fit generalized Pareto distribution
     tail_scores = scores[scores > np.percentile(scores, p)]

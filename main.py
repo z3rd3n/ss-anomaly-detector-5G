@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # main.py
-from utils import start_logging, bring_approach
+from utils import start_logging, bring_approach, count_trainable_parameters
 from data.dataLoader import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
 from torch import optim
@@ -11,6 +11,8 @@ import logging
 def main(params, train_func, detect_func):    
     logging.info("Building model...")
     model = params.build_model()
+    trainable_params = count_trainable_parameters(model)
+    logging.info(f'Number of trainable parameters: {trainable_params/1000:.1f}K')
 
     logging.info("Creating train and validation datasets...")
     train_dataset, val_dataset = ParquetSequenceDataset.create_train_val_splits(
@@ -41,12 +43,10 @@ def main(params, train_func, detect_func):
     )
 
     logging.info("Initializing optimizer and scheduler...")
-    if params.optimizer_name == "Adam":
-        optimizer = optim.Adam(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
-    elif params.optimizer_name == "AdamW":
+    if params.optimizer_name == 'Adam':
+        optimizer = optim.AdamW(model.parameters(), lr=params.learning_rate)
+    if params.optimizer_name == 'AdamW':
         optimizer = optim.AdamW(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
-    else:  # SGD
-        optimizer = optim.SGD(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay, momentum=0.9)
 
     scheduler = ReduceLROnPlateau(
         optimizer,

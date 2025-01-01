@@ -9,17 +9,17 @@ class Config:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        self.train = False
+        self.train = True
         self.detect = True
-        self.seq_len = 32
+        self.seq_len = 70
         self.stride = None
-        self.batch_size = 128
+        self.batch_size = 32
         self.num_epochs = 15
         self.validation_ratio=0.2
-        self.learning_rate = 1e-4
+        self.learning_rate = 9.2e-3
 
         self.optimizer_name = 'AdamW'
-        self.weight_decay = 6e-5
+        self.weight_decay = 9e-3
 
         self.feature_columns = [
             'SFN', 'Slot', 'CC', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI',
@@ -36,16 +36,16 @@ class Config:
         self.output_dir = results_dir
 
         # Model architecture params
-        self.model_dim = 512       # d_model
-        self.n_heads = 12          # number of attention heads
+        self.model_dim = 1024       # d_model
+        self.n_heads = 4          # number of attention heads
         self.e_layers = 4         # number of encoder layers
         self.activation = 'gelu'  # activation function
-        self.k_value = 2        # trade-off parameter for loss
+        self.k_value = 19.65        # trade-off parameter for loss
         self.lamda_rec = 2
-        self.negative_qk = False
-        self.dropout = 0.15
-        self.span = [4,12]
-        self.one_side = False
+        self.negative_qk = True
+        self.dropout = 0.5
+        self.span = [18,35]
+        self.one_side = True
         self.max_grad_norm = 5.0
 
         # Training specific params
@@ -74,3 +74,5 @@ class Config:
             negative_qk=self.negative_qk
         ).to(self.device)
         return model
+
+
