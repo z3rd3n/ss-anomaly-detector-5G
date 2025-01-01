@@ -5,7 +5,7 @@ from subAdjacent.run_epoch import train_one_epoch, validate_one_epoch
 from utils import *
 from tqdm import tqdm
 # import softm
-
+# deneme
 
 def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
     start_epoch = 0
