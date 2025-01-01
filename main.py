@@ -41,7 +41,10 @@ def main(params, train_func, detect_func):
     )
 
     logging.info("Initializing optimizer and scheduler...")
-    optimizer = optim.Adam(model.parameters(), lr=params.learning_rate)
+    if params.optimizer_name == 'Adam':
+        optimizer = optim.AdamW(model.parameters(), lr=params.learning_rate)
+    if params.optimizer_name == 'AdamW':
+        optimizer = optim.AdamW(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
 
     scheduler = ReduceLROnPlateau(
         optimizer,

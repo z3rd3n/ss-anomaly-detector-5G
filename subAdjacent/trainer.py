@@ -13,7 +13,6 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
             model,
             optimizer,
             params.checkpoint_path,
-            params.device
         )
         logging.info(f"Resuming training from epoch {start_epoch + 1} and from loss {prev_loss:.4f}")
         start_epoch += 1

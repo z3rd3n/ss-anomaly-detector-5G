@@ -9,24 +9,24 @@ class Config:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        self.train = False
-        self.debug = False
+        self.train = True
+        self.detect = True
         self.seq_len = 32
         self.stride = None
-        self.batch_size = 64
-        self.num_epochs = 50
+        self.batch_size = 128
+        self.num_epochs = 10
         self.validation_ratio=0.2
         self.learning_rate = 1e-4
-        self.pretrain= None
+
         self.optimizer_name = 'Adam'
-        self.weight_decay = 1e-6
+        self.weight_decay = 6e-5
 
         self.feature_columns = [
             'SFN', 'Slot', 'CC', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI',
         ]
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.checkpoint_path = None  # Path to load checkpoint from
+        self.checkpoint_path = 'subAdjacent/results/checkpoint_epoch_5.pt'  # Path to load checkpoint from
 
         # Directories
         self.parquet_path = "data/scaled_pdsch.parquet"
@@ -36,19 +36,23 @@ class Config:
         self.output_dir = results_dir
 
         # Model architecture params
-        self.model_dim = 128       # d_model
-        self.n_heads = 8          # number of attention heads
-        self.e_layers = 3         # number of encoder layers
+        self.model_dim = 512       # d_model
+        self.n_heads = 12          # number of attention heads
+        self.e_layers = 4         # number of encoder layers
         self.activation = 'gelu'  # activation function
-        self.k_value = 0.5        # trade-off parameter for loss
-        self.dropout = 0.1
-        self.span = [4,8]
+        self.k_value = 2        # trade-off parameter for loss
+        self.dropout = 0.15
+        self.span = [4,12]
         self.one_side = False
         self.max_grad_norm = 5.0
 
         # Training specific params
         self.shuffle_files = True
         self.output_attention = True
+
+        # EVT params
+        self.p = 95 # percentile
+        self.q = 0.99 # quantile
 
         # System params
         self.num_workers = 0

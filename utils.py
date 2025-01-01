@@ -17,7 +17,7 @@ def start_logging(params=None, approach=None):
     if params is None and approach is None:
         output_dir = 'results'
     else:
-        experiment_name = f"{current_time}_T{1 if params.train else 0}_D{1 if params.detect else 0}_q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
+        experiment_name = f"T{1 if params.train else 0}_D{1 if params.detect else 0}_q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
         output_dir = os.path.join(output_dir, experiment_name)
         params.output_dir = output_dir
 
@@ -45,7 +45,7 @@ def start_logging(params=None, approach=None):
 
 def save_checkpoint(model, optimizer, epoch, loss, params):
     checkpoint_dir = os.path.join(params.output_dir, 'checkpoints')
-    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt')
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_best.pt')
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
