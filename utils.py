@@ -10,14 +10,19 @@ from scipy import stats
 import pandas as pd
 
 
-def start_logging(output_dir='results'):
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-
+def start_logging(params=None, approach=None):
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    script_dir = os.path.dirname(__file__)
-    dir = os.path.join(script_dir, output_dir)
-    log_dir = os.path.join(dir, 'logs')
+    if approach is not None:
+        output_dir = os.path.join(approach, 'results')
+    if params is None and approach is None:
+        output_dir = 'results'
+    else:
+        experiment_name = f"{current_time}_T{1 if params.train else 0}_D{1 if params.detect else 0}_q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
+        output_dir = os.path.join(output_dir, experiment_name)
+        params.output_dir = output_dir
+
+
+    log_dir = os.path.join(output_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'logTraining_{current_time}.log')
     logging.basicConfig(
@@ -32,9 +37,15 @@ def start_logging(output_dir='results'):
     console.setFormatter(formatter)
     logging.getLogger('').addHandler(console)
 
+    if params is not None:
+        logging.info("Hyperparameters and settings:")
+        for key, value in vars(params).items():
+            logging.info(f"{key}: {value}")
+
 
 def save_checkpoint(model, optimizer, epoch, loss, params):
-    checkpoint_path = os.path.join(params.output_dir, f'checkpoint_epoch_{epoch+1}.pt')
+    checkpoint_dir = os.path.join(params.output_dir, 'checkpoints')
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt')
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -44,15 +55,16 @@ def save_checkpoint(model, optimizer, epoch, loss, params):
     logging.info(f"Checkpoint saved: {checkpoint_path}")
 
 def load_last_checkpoint(params, model, optimizer):
-    result_files = [f for f in os.listdir(params.output_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
+    checkpoint_dir = os.path.join(params.output_dir, 'checkpoints')
+    result_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
     if not result_files:
-        logging.info(f"No checkpoints found in {params.output_dir}, aborting detection.")
+        logging.info(f"No checkpoints found in {checkpoint_dir}, aborting detection.")
         return
 
     def get_epoch(fname):
         return int(fname.split('_')[-1].replace('.pt',''))
     result_files_sorted = sorted(result_files, key=lambda x: get_epoch(x))
-    last_ckpt = os.path.join(params.output_dir, result_files_sorted[-1])
+    last_ckpt = os.path.join(checkpoint_dir, result_files_sorted[-1])
     logging.info(f"Loading last checkpoint: {last_ckpt}")
 
     epoch, loss = load_checkpoint(model, optimizer, last_ckpt)
@@ -229,12 +241,14 @@ def unscale_features(features):
 def unscale_and_save_anomalies(
     timestamps,
     features,
+    enc_outputs,
     anomaly_scores,
     threshold,
     output_csv
 ):
   
     unscaled = unscale_features(features)
+    predicted = unscale_features(enc_outputs)
 
     anomaly_indices = np.where(anomaly_scores >= threshold)[0]
     logging.info(f"Total anomaly count: {len(anomaly_indices)} from {len(anomaly_scores)} ratio {len(anomaly_indices)/len(anomaly_scores)} (threshold={threshold})")
@@ -249,13 +263,21 @@ def unscale_and_save_anomalies(
         anomalies = pd.DataFrame({
             'timestamp_str': [timestamps[i] for i in anomaly_indices],
             'SFN': unscaled[anomaly_indices, 0].astype(int),
+            'SFN_p': predicted[anomaly_indices, 0].astype(int),
             'Slot': unscaled[anomaly_indices, 1].astype(int),
+            'Slot_p': predicted[anomaly_indices, 1].astype(int),
             'CC': unscaled[anomaly_indices, 2].astype(int),
+            'CC_p': predicted[anomaly_indices, 2].astype(int),
             'HARQ': unscaled[anomaly_indices, 3].astype(int),
+            'HARQ_p': predicted[anomaly_indices, 3].astype(int),
             'MCS': unscaled[anomaly_indices, 4].astype(int),
+            'MCS_p': predicted[anomaly_indices, 4].astype(int),
             'CRC': unscaled[anomaly_indices, 5].astype(int),
+            'CRC_p': predicted[anomaly_indices, 5].astype(int),
             'ReTx': unscaled[anomaly_indices, 6].astype(int),
+            'ReTx_p': predicted[anomaly_indices, 6].astype(int),
             'NDI': unscaled[anomaly_indices, 7].astype(int),
+            'NDI_p': predicted[anomaly_indices, 7].astype(int),
             'threshold': threshold,
             'anomaly_score': anomaly_scores[anomaly_indices],  # Add anomaly scores,
             'distance_from_threshold': (anomaly_scores[anomaly_indices] - threshold)
@@ -279,9 +301,9 @@ def unscale_and_save_anomalies(
     plt.close()
 
 
-def calculate_threshold_evt(scores, q=0.99):
+def calculate_threshold_evt(scores, q=0.99, p=95):
     # Fit generalized Pareto distribution
-    tail_scores = scores[scores > np.percentile(scores, 95)]
+    tail_scores = scores[scores > np.percentile(scores, p)]
     shape, loc, scale = stats.genpareto.fit(tail_scores)
     
     # Calculate threshold using inverse CDF
@@ -295,4 +317,4 @@ def bring_approach(args):
         train_func = train_model
         detect_func = detect_anomalies
         config = Config()
-    return {'params': config, 'train_func': train_func, 'detect_func': detect_func}
+    return config, train_func, detect_func

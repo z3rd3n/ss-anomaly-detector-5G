@@ -5,3 +5,5 @@ reportable/
 *.whl
 prompt.py
 subAdjacent/results/
+results/
+*.db

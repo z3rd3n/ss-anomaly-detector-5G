@@ -4,10 +4,6 @@ import optuna
 import logging
 from utils import start_logging
 
-# For Optuna plotting
-import optuna.visualization.matplotlib as optuna_plot
-import matplotlib.pyplot as plt
-import os
 
 # Import your existing code
 from subAdjacent.configClass import Config
@@ -26,7 +22,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     # 1. Create a fresh config
     config = Config()
     config.train = True  # We do want to train in these trials
-    config.num_epochs = 2  # Fewer epochs for faster search
+    config.num_epochs = 1  # Fewer epochs for faster search
 
     # 2. Suggest hyperparameters
     # Here are examples; you can add or remove based on your needs:
@@ -80,11 +76,11 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 
     if len(train_dataset.file_ids) > 10:
-        train_dataset.file_ids = train_dataset.file_ids[:25]
+        train_dataset.file_ids = train_dataset.file_ids[:1]
         train_dataset.num_files = len(train_dataset.file_ids)
 
     if len(val_dataset.file_ids) > 2:
-        val_dataset.file_ids = val_dataset.file_ids[:5]
+        val_dataset.file_ids = val_dataset.file_ids[:1]
         val_dataset.num_files = len(val_dataset.file_ids)
 
     # 5. Create DataLoaders
@@ -174,54 +170,33 @@ def run_training_for_trial(config, model, optimizer, scheduler, train_loader, va
 
     return best_val_loss
 
-
 def main():
     start_logging()
-    optuna.samplers.TPESampler(seed=42)
-    study = optuna.create_study(direction='minimize')  # Minimizing validation loss
+    
+    # Create a study name and storage
+    study_name = "optimization_study"
+    storage_name = "sqlite:///optuna_study.db"
+    
+    # Load or create study with storage
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_name,
+        direction='minimize',
+        load_if_exists=True
+    )
+    
+    # Run optimization
     study.optimize(
         objective,
-        n_trials=25,
+        n_trials=4,
         show_progress_bar=True,
     )
 
-    logging.info("Hyperparameter search complete.")
-    logging.info(f"Best trial value (val_loss): {study.best_trial.value}")
-    logging.info(f"Best trial params: {study.best_trial.params}")
-
-    plot_dir = "optuna_plots"
-    os.makedirs(plot_dir, exist_ok=True)
-
-    # 2) Plot the optimization history
-    fig1 = optuna_plot.plot_optimization_history(study)
-    fig1.savefig(os.path.join(plot_dir, "optimization_history.png"))
-    plt.close(fig1)
-
-    # 3) Plot the parallel coordinate plot
-    fig2 = optuna_plot.plot_parallel_coordinate(study)
-    fig2.savefig(os.path.join(plot_dir, "parallel_coordinate.png"))
-    plt.close(fig2)
-
-    # 4) Plot the hyperparameter slice plots
-    fig3 = optuna_plot.plot_slice(study)
-    fig3.savefig(os.path.join(plot_dir, "slice_plot.png"))
-    plt.close(fig3)
-
-    # 5) Plot the parameter importances
-    try:
-        fig4 = optuna_plot.plot_param_importances(study)
-        fig4.savefig(os.path.join(plot_dir, "param_importances.png"))
-        plt.close(fig4)
-    except ValueError:
-        # Sometimes param importances can't be computed if we have categorical params only, etc.
-        logging.warning("Could not plot param importances (possibly all categorical params).")
-
-    # 6) Plot contour (shows 2D relationships among hyperparameters)
-    fig5 = optuna_plot.plot_contour(study)
-    fig5.savefig(os.path.join(plot_dir, "contour_plot.png"))
-    plt.close(fig5)
-
-    logging.info(f"Optuna plots saved to '{plot_dir}' directory.")
+    # Print dashboard instructions
+    logging.info("\n=== Optuna Dashboard Instructions ===")
+    logging.info("To view the dashboard, run the following command in your terminal:")
+    logging.info("optuna-dashboard sqlite:///optuna_study.db")
+    logging.info("Then open http://127.0.0.1:8080 in your browser")
 
 
 if __name__ == "__main__":

@@ -4,8 +4,7 @@ import torch
 from subAdjacent.run_epoch import train_one_epoch, validate_one_epoch
 from utils import *
 from tqdm import tqdm
-# import softm
-# deneme
+
 
 def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
     start_epoch = 0
@@ -82,7 +81,7 @@ def detect_anomalies(params, model, optimizer, val_loader):
     load_last_checkpoint(params, model, optimizer)
     
     model.eval()
-    all_scores = []
+    all_preds= []
     all_features = []
     all_timestamps = []
     criterion_mse = torch.nn.MSELoss(reduction='none')
@@ -108,19 +107,22 @@ def detect_anomalies(params, model, optimizer, val_loader):
             train_score = softmax(-loss_attn) * rec_loss
             train_energy.append(train_score.cpu().numpy())
             all_features.append(features.cpu().numpy())
+            all_preds.append(enc_out.cpu().numpy())
             all_timestamps.extend([t for sublist in timestamps for t in sublist])
 
     train_attn_array = np.concatenate(train_energy, axis=0).reshape(-1)
     all_features = np.concatenate(all_features, axis=0).reshape(-1, len(params.feature_columns))
+    all_preds = np.concatenate(all_preds, axis=0).reshape(-1, len(params.feature_columns))
    
     # Calculate threshold using EVT
-    threshold = calculate_threshold_evt(train_attn_array)
+    threshold = calculate_threshold_evt(train_attn_array, params.p, params.q)
     anomalies_mask = train_attn_array > threshold
     
     # Save results
     unscale_and_save_anomalies(
         timestamps=all_timestamps,
         features=all_features,
+        predictions=all_preds,
         anomaly_scores=train_attn_array,
         threshold=threshold,
         output_csv=os.path.join(params.output_dir, "detected_anomalies.csv")

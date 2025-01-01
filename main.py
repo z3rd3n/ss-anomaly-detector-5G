@@ -9,8 +9,6 @@ import argparse
 import logging
 
 def main(params, train_func, detect_func):    
-    start_logging(params.output_dir)
-
     logging.info("Building model...")
     model = params.build_model()
 
@@ -64,7 +62,7 @@ def main(params, train_func, detect_func):
             train_loader,
             val_loader,
         )
-    else:
+    if params.detect:
         logging.info("Starting detection...")
         detect_func(
             params, 
@@ -77,4 +75,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the main script with specified approach.")
     parser.add_argument('--approach', type=str, default='subAdjacent', help='Specify the approach to use.')
     args = parser.parse_args()
-    main(**bring_approach(args))
+
+    config, train_func, detect_func = bring_approach(args)
+    start_logging(config, args.approach)
+    main(config, train_func, detect_func)
