@@ -113,7 +113,7 @@ def plot_attention_matrices(
     device, 
     output_dir, 
     max_plots=5,   # how many batches you want to visualize
-    max_heads=8,    # how many heads per batch you want to plot
+    max_heads=12,    # how many heads per batch you want to plot
     sample_idx=16    # which sample in the batch to visualize
 ):
     """
@@ -290,17 +290,6 @@ def unscale_and_save_anomalies(
         anomalies.to_csv(output_csv, index=False)
 
     logging.info(f"Anomalies saved to CSV => {output_csv}")
-
-    # Create histogram of anomaly scores
-    plt.figure(figsize=(10, 6))
-    plt.hist(anomaly_scores, bins=50, edgecolor='black')
-    plt.axvline(x=threshold, color='r', linestyle='--', label=f'Threshold ({threshold:.2f})')
-    plt.title('Distribution of Anomaly Scores')
-    plt.xlabel('Anomaly Score')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.savefig('subAdjacent/results/anomaly_scores_histogram.png')
-    plt.close()
 
 
 def calculate_threshold_evt(scores, q=0.99, p=95):

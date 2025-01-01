@@ -114,7 +114,7 @@ def detect_anomalies(params, model, optimizer, val_loader):
     all_preds = np.concatenate(all_preds, axis=0).reshape(-1, len(params.feature_columns))
    
     # Calculate threshold using EVT
-    threshold = calculate_threshold_evt(train_attn_array, params.p, params.q)
+    threshold = calculate_threshold_evt(train_attn_array, params.q, params.p)
     anomalies_mask = train_attn_array > threshold
     
     # Save results
