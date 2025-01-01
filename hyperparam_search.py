@@ -182,7 +182,6 @@ def main():
         objective,
         n_trials=30,  # Increased number of trials
         show_progress_bar=True,
-        n_jobs=2  # Parallel execution if possible
     )
     
     logging.info("\n=== Optuna Dashboard Instructions ===")
