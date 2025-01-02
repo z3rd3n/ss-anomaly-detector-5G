@@ -311,4 +311,11 @@ def bring_approach(args):
         train_func = train_model
         detect_func = detect_anomalies
         config = Config()
+
+    elif args.approach == 'subAdjacentLSTM':
+        from subAdjacentLSTM.trainer import train_model, detect_anomalies
+        from subAdjacentLSTM.configClass import Config
+        train_func = train_model
+        detect_func = detect_anomalies
+        config = Config()
     return config, train_func, detect_func
