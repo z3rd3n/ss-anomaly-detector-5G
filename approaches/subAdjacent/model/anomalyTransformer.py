@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from subAdjacent.model.attentionsLayer import LinearAnomalyAttention, AttentionLayer
-from subAdjacent.model.dataEmbedding import DataEmbedding
+from approaches.subAdjacent.model.attentionsLayer import LinearAnomalyAttention, AttentionLayer
+from approaches.subAdjacent.model.dataEmbedding import DataEmbedding
 
 
 class EncoderLayer(nn.Module):

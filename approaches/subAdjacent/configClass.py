@@ -11,15 +11,15 @@ class Config:
 
         self.train = True
         self.detect = True
-        self.seq_len = 70
+        self.seq_len = 50
         self.stride = None
         self.batch_size = 32
-        self.num_epochs = 15
+        self.num_epochs = 100
         self.validation_ratio=0.2
-        self.learning_rate = 9.2e-3
+        self.learning_rate = 1e-4
 
         self.optimizer_name = 'AdamW'
-        self.weight_decay = 9e-3
+        self.weight_decay = 1e-4
 
         self.feature_columns = [
             'SFN', 'Slot', 'CC', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI',
@@ -36,16 +36,16 @@ class Config:
         self.output_dir = results_dir
 
         # Model architecture params
-        self.model_dim = 1024       # d_model
-        self.n_heads = 4          # number of attention heads
+        self.model_dim = 256       # d_model
+        self.n_heads = 8          # number of attention heads
         self.e_layers = 4         # number of encoder layers
         self.activation = 'gelu'  # activation function
-        self.k_value = 19.65        # trade-off parameter for loss
+        self.k_value = 10        # trade-off parameter for loss
         self.lamda_rec = 2
         self.negative_qk = True
         self.dropout = 0.5
-        self.span = [18,35]
-        self.one_side = True
+        self.span = [10,20]
+        self.one_side = False
         self.max_grad_norm = 5.0
 
         # Training specific params
@@ -61,7 +61,7 @@ class Config:
         self.pin_memory = True
 
     def build_model(self):
-        from subAdjacent.model.anomalyTransformer import AnomalyTransformer
+        from approaches.subAdjacent.model.anomalyTransformer import AnomalyTransformer
         model = AnomalyTransformer(
             enc_in=len(self.feature_columns),
             c_out=len(self.feature_columns),
