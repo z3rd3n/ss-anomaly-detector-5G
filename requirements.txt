@@ -1,8 +1,10 @@
 matplotlib==3.10.0
+mlflow==2.19.0
+mlflow_skinny==2.19.0
 numpy==2.2.1
 optuna==4.1.0
 pandas==2.2.3
 pyarrow==18.1.0
-scipy==1.14.1
+scipy==1.15.0
 torch==2.5.1
 tqdm==4.67.1

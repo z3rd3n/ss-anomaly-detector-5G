@@ -45,7 +45,7 @@ def create_search_space(trial: optuna.trial.Trial) -> Dict[str, Any]:
         "dropout": trial.suggest_float("architecture/dropout", 0.0, 0.5, step=0.1),
         
         # Sequence parameters
-        "seq_len": trial.suggest_categorical("sequence/seq_len", [25, 50, 100, 200]),
+        "seq_len": trial.suggest_categorical("sequence/seq_len", [50, 100, 200]),
         "one_side": trial.suggest_categorical("sequence/one_side", [True, False]),
         "negative_qk": trial.suggest_categorical("sequence/negative_qk", [True, False]),
         
@@ -68,7 +68,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     torch.cuda.empty_cache()
     config = Config()
     config.train = True
-    config.num_epochs = 1
+    config.num_epochs = 3
 
     # Get hyperparameters from search space
     params = create_search_space(trial)
@@ -110,10 +110,10 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     # Limit dataset size for faster trials
     if len(train_dataset.file_ids) > 1:
-        train_dataset.file_ids = train_dataset.file_ids[:2]
+        train_dataset.file_ids = train_dataset.file_ids[:10]
         train_dataset.num_files = len(train_dataset.file_ids)
     if len(val_dataset.file_ids) > 1:
-        val_dataset.file_ids = val_dataset.file_ids[:1]
+        val_dataset.file_ids = val_dataset.file_ids[:2]
         val_dataset.num_files = len(val_dataset.file_ids)
 
     logging.info(f"\nDataset Information:")

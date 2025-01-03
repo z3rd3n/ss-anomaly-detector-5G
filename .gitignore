@@ -1,7 +1,8 @@
 .tez
 data/scaled_pdsch.parquet
 __pycache__/
-reportable/
+*reportable/
+*mlruns/
 prompt.py
 subAdjacent/results/
 results/
