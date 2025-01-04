@@ -4,24 +4,49 @@ import mlflow.pytorch
 import os
 import logging
 from mlflow.tracking import MlflowClient
+import glob
 
-def start_mlflow_run(experiment_name: str, run_name: str = None) -> None:
+def start_mlflow_run(experiment_name: str, params) -> None:
     """
     Sets or creates an MLflow experiment and starts a run under it.
     """
-    local_tracking_dir = "/workspaces/thesis/detect/mlruns"
-    mlflow.ui(port=5000, host="0.0.0.0")
-    mlflow.set_tracking_uri(f"file://{local_tracking_dir}")
-    mlflow.set_experiment(experiment_name)
-    mlflow.start_run(run_name=run_name)
-    # Ensure this directory exists
+    run_name = (
+    f"q{str(params.q)[-2:]}::p{params.p}::s{params.seq_len}::stride{params.stride if params.stride is not None else 'st-1'}::h{params.n_heads}::"
+    f"e{params.e_layers}::d{params.model_dim}::batch{params.batch_size}::"
+    f"k{str(params.k_value)}::dr{int(params.dropout * 100)}::rec{params.lamda_rec}::"
+    f"span{params.span[0]}::{params.span[1]}::"
+    f"side{1 if params.one_side else 0}::negQK{1 if params.negative_qk else 0}"
+    f"::grad{params.max_grad_norm}"
+    f"::lr{str(params.learning_rate)}::wd{str(params.weight_decay)}"
+    f"::opt{params.optimizer_name}"
+    f"::fun{params.activation}"
+)
 
+    local_tracking_dir = "/workspaces/thesis/detect/mlruns"
+    mlflow.set_tracking_uri(f"file://{local_tracking_dir}")
     
+    client = MlflowClient()
+    experiment = client.get_experiment_by_name(experiment_name)
+    if not experiment:
+        experiment_id = client.create_experiment(experiment_name)
+    else:
+        experiment_id = experiment.experiment_id
+        
+    existing_runs = client.search_runs(
+        experiment_ids=[experiment_id],
+        filter_string=f"tag.mlflow.runName = '{run_name}'"
+    )
+    
+    if existing_runs:
+        mlflow.start_run(run_id=existing_runs[0].info.run_id)
+    else:
+        mlflow.start_run(run_name=run_name)
+
     logging.info(f"Started MLflow run under experiment: {experiment_name}, run name: {run_name}")
 
 def log_params_from_config(config_obj: object) -> None:
     """
-    Logs all attributes from a config class to MLflow as parameters.
+    Logs all attributes from a config class to MLflow as paramseters.
     """
     cfg_dict = vars(config_obj)
     for k, v in cfg_dict.items():
@@ -39,31 +64,25 @@ def log_torch_model(model, artifact_path: str = "models", **kwargs) -> None:
     mlflow.pytorch.log_model(model, artifact_path, **kwargs)
     logging.info(f"Model logged to MLflow at artifact path: {artifact_path}")
 
-def log_checkpoint_artifact(checkpoint_path: str, artifact_path: str = "checkpoints") -> None:
-    """
-    Logs a .pt checkpoint file as an MLflow artifact. 
-    You can later download it to do detection with different parameters.
-    """
+def log_checkpoint_artifact(input_dir) -> None:
+    checkpoint_path = os.path.join(input_dir,"checkpoints", "checkpoint_best.pt")
+    artifact_path = "best_model"
     if os.path.exists(checkpoint_path):
         mlflow.log_artifact(checkpoint_path, artifact_path)
         logging.info(f"Checkpoint artifact logged: {checkpoint_path}")
     else:
         logging.warning(f"Checkpoint path does not exist: {checkpoint_path}")
 
-def log_plot(plot_path: str, artifact_path: str = "") -> None:
-    """
-    Logs a single plot (PNG) file to MLflow artifacts. 
-    """
-    if os.path.exists(plot_path):
-        mlflow.log_artifact(plot_path, artifact_path)
-        logging.info(f"Plot artifact logged: {plot_path}")
-    else:
-        logging.warning(f"Plot path does not exist: {plot_path}")
+def log_plots(input_dir: str) -> None:
+    for file in glob.glob(os.path.join(input_dir, "*.png")):
+        artifact_path = "attention_plots" if "attention" in file else "results"
+        mlflow.log_artifact(file, artifact_path)
+
+def log_anomalies(input_dir: str) -> None:
+    for file in glob.glob(os.path.join(input_dir, "*.csv")):
+        mlflow.log_artifact(file, "anomalies")
 
 def end_mlflow_run() -> None:
-    """
-    Ends the MLflow run.
-    """
     mlflow.end_run()
 
 def download_artifact(run_id: str, artifact_path: str, dst_path: str = None) -> str:
