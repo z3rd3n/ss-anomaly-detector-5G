@@ -1,6 +1,11 @@
 # subAdjacent/trainer.py
 import logging
 import torch
+import os
+import sys
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 from subAdjacent.run_epoch import train_one_epoch, validate_one_epoch
 from utils import *
 from tqdm import tqdm
@@ -78,8 +83,9 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
     logging.info("Training finished.")
 
 
-def detect_anomalies(params, model, optimizer, val_loader):
-    load_checkpoint(model, optimizer, params.output_dir)
+def detect_anomalies(params, model, optimizer, val_loader, mlflow=False):
+    if not mlflow:
+        load_checkpoint(model, optimizer, params.output_dir)
     
     model.eval()
     all_preds= []

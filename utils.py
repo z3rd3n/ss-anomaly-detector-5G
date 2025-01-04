@@ -58,6 +58,8 @@ def save_checkpoint(model, optimizer, epoch, loss, params):
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
         'optimizer_name': type(optimizer).__name__,  # Logging optimizer's class name
+        'learning_rate': params.learning_rate if hasattr(params, 'learning_rate') else None,
+        'weight_decay': params.weight_decay if hasattr(params, 'weight_decay') else None
     }
 
     # Save the checkpoint
@@ -78,7 +80,7 @@ def load_checkpoint(model, optimizer, output_dir):
     checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
 
     device = next(model.parameters()).device
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location= "cuda" if torch.cuda.is_available() else "cpu", weights_only=True)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']

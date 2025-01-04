@@ -7,3 +7,4 @@ prompt.py
 subAdjacent/results/
 results/
 *.db
+*temp/

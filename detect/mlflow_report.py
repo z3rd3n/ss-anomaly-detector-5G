@@ -17,16 +17,17 @@ def main(reportable: str):
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    start_mlflow_run(experiment_name="subAdjacent", params=params)
+    start_mlflow_run(experiment_name="subAdjacent", run_name="detect")
     log_params_from_config(params)
     log_plots(input_dir)
+    log_log(input_dir)
     log_anomalies(input_dir)
     log_torch_model(model, "model")
     log_checkpoint_artifact(input_dir)
 
 
 if __name__ == "__main__":
-    folder_name = "q99p95_s100_h8_e4_d32"
+    folder_name = "q99p95_s32_h12_e4_d512"
     main(folder_name)
     end_mlflow_run()
 

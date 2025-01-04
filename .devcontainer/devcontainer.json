@@ -1,7 +1,8 @@
 {
 	"name": "Python 3",
 	"image": "mcr.microsoft.com/devcontainers/python:1-3.12-bullseye",
-	"forwardPorts": [5000],       // <--- add this
+	"forwardPorts": [8000],     
+	"appPort": ["8000:8000"],
 	"postCreateCommand": "pip install --user -r requirements.txt",
 	"customizations": {
 	  "vscode": {
