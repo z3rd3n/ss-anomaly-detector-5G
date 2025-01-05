@@ -29,27 +29,23 @@ def detect_in_existing_run(
     5) Runs detect_anomalies
     6) Logs new artifacts under `detection_artifact_path` in the same run
     """
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
 
     mlflow.set_experiment("subAdjacent")  
     mlflow.start_run(run_id=run_id)
     logging.info(f"Resumed MLflow run: {run_id}")
-    local_log_folder = download_artifact(run_id, "logs", dst_path="temp")
-
     params = Config()
+    model = params.build_model()
+    local_log_folder = download_artifact(run_id, "logs", dst_path=temp_dir)
+
     log_file = bring_log_file(local_log_folder) 
     params = extract_params_from_log(log_file, params)
-    # update params with log_params dict
-    
-    model = params.build_model()
-    params.output_dir = "temp"  
-
-    os.makedirs(params.output_dir, exist_ok=True)
+    params.output_dir = temp_dir
     local_ckpt_path = download_artifact(run_id, "checkpoints/checkpoint_best.pt", dst_path=params.output_dir)
 
     
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"CUDA Available: {torch.cuda.is_available()}")
-    print(f"MPS Available: {torch.backends.mps.is_available()}")
     print(f"Selected device: {device}")
     checkpoint = torch.load(local_ckpt_path, map_location=device , weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -87,7 +83,6 @@ def detect_in_existing_run(
 
     detect_anomalies(params, model, optimizer, val_loader, mlflow=True)
 
-    
     for file_path in glob.glob(os.path.join(params.output_dir, "*.*")):
         mlflow.log_artifact(file_path, artifact_path=detection_artifact_path)
         logging.info(f"Logged detect artifact => {file_path}")
@@ -98,8 +93,5 @@ def detect_in_existing_run(
 
 
 if __name__ == "__main__":
-    # Example usage
-    # 1) supply the run_id you want to resume
-    # 2) optionally choose a subfolder for detection artifacts
-    run_id = "4c1cb482a928404ba86b2cba82e21e3e"  # your real run_id from MLflow
+    run_id = "6bff62fcf0644fb4bb06c09c4c0c2abe"  # your real run_id from MLflow
     detect_in_existing_run(run_id, "detect_anomalies")

@@ -9,9 +9,8 @@ from approaches.subAdjacent.configClass import Config
 from detect.mlflow_utils import *
 
 
-def main(reportable: str): 
+def main(input_dir: str): 
 
-    input_dir = os.path.join("detect/reportable", reportable)
     params = Config()
     model = params.build_model()
 
@@ -27,7 +26,7 @@ def main(reportable: str):
 
 
 if __name__ == "__main__":
-    folder_name = "q99p95_s32_h12_e4_d512"
+    folder_name = "detect/reportable/results"
     main(folder_name)
     end_mlflow_run()
 
