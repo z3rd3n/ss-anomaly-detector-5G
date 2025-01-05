@@ -1,156 +1,192 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import sys
 import os
-
-# ------------------------------------------------------------------------------
-# 1) Utility functions
-# ------------------------------------------------------------------------------
-
-def parse_timestamp_str(timestamp_str):
-    """
-    Given something like: 'some_file.csv;2024-05-16 10:00:00;3;12'
-    Return: file_name, raw_timestamp, sfn, slot
-    """
-    parts = timestamp_str.split(";")
-    # Adapt if your actual format differs
-    file_name    = parts[0]
-    raw_ts       = parts[1]
-    sfn          = int(parts[2])
-    slot         = int(parts[3])
-    return file_name, raw_ts, sfn, slot
-
-# ------------------------------------------------------------------------------
-# 2) Streamlit app main function
-# ------------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+from utils import unscale_features
 
 def main():
-    st.title("Anomaly Labeling App")
-
-    # User-set paths
-    anomalies_csv_path = "detect/detected_anomalies.csv"
-    parquet_path       = "data/scaled_pdsch.parquet"
-    output_csv_path    = "labeled_anomalies.csv"
+    st.set_page_config(layout="wide")  # Make the page wider
     
-    # --- Load the anomalies CSV
-    if not os.path.exists(anomalies_csv_path):
-        st.error(f"Cannot find anomalies CSV: {anomalies_csv_path}")
-        return
-    
-    anomalies_df = pd.read_csv(anomalies_csv_path)
-    if anomalies_df.empty:
-        st.warning("No rows in anomalies CSV.")
-        return
-    
-    # --- Load the Parquet data
-    if not os.path.exists(parquet_path):
-        st.error(f"Cannot find Parquet file: {parquet_path}")
-        return
+    # Layout: two columns, col1 (main content) and col2 (controls on the right)
+    col1, col2 = st.columns([4, 1], gap="large")
 
-    parquet_df = pd.read_parquet(parquet_path)
-    if parquet_df.empty:
-        st.warning("No rows in Parquet data.")
-        return
+    # ----------------------------------------------------------------------------
+    # In col2, we place what used to be the sidebar controls
+    # ----------------------------------------------------------------------------
+    with col2:
+        st.header("Controls")
 
-    st.write("Loaded anomalies:", anomalies_df.shape)
-    st.write("Loaded parquet:", parquet_df.shape)
-
-    # For storing user labels in memory while app is running
-    if "labels" not in st.session_state:
-        # Initialize with None
-        st.session_state.labels = [None] * len(anomalies_df)
-    if "current_index" not in st.session_state:
-        st.session_state.current_index = 0
-
-    # If we're beyond last anomaly, let user finalize
-    if st.session_state.current_index >= len(anomalies_df):
-        st.success("No more anomalies to label. You can save/export your results.")
+        score_placeholder = st.empty()
+        threshold_placeholder = st.empty()
+        distance_placeholder = st.empty()
         
-        # Provide a button to save
-        if st.button("Save labeled anomalies to CSV"):
-            labeled_df = anomalies_df.copy()
-            labeled_df["user_label"] = st.session_state.labels
-            labeled_df.to_csv(output_csv_path, index=False)
-            st.success(f"Labeled anomalies saved to: {output_csv_path}")
-        return
+        # Window controls
+        WINDOW_BEFORE = st.number_input("Rows before anomaly", min_value=0, value=20, step=1)
+        WINDOW_AFTER = st.number_input("Rows after anomaly", min_value=0, value=20, step=1)
 
-    # ------------------------------------------------------------------------------
-    # 3) Show the current anomaly
-    # ------------------------------------------------------------------------------
-    idx = st.session_state.current_index
-    anomaly_row = anomalies_df.iloc[idx]
-    st.subheader(f"Anomaly #{idx+1} of {len(anomalies_df)}")
-    st.write(anomaly_row)
+    # ----------------------------------------------------------------------------
+    # Main content area (col1)
+    # ----------------------------------------------------------------------------
+    with col1:
+        st.title("Anomaly Labeling App")
 
-    # Parse the anomaly's timestamp_str to get file_name, raw_ts, sfn, slot
-    timestamp_str = anomaly_row["timestamp_str"]
-    file_name, raw_ts, sfn, slot = parse_timestamp_str(timestamp_str)
-
-    # --- Example logic to match the row inside your parquet data.
-    # If your parquet has columns like file_id, SFN, Slot, etc., adapt accordingly.
-    # For example, if your parquet actually has columns ["file_name", "SFN", "Slot", ...],
-    # you can do:
-    matched_indices = parquet_df[
-        (parquet_df["SFN"] == sfn) &
-        (parquet_df["Slot"] == slot)
-        # If you actually store a file_name or file_id, you can do:
-        # (parquet_df["file_name"] == file_name)
-        # or
-        # (parquet_df["file_id"] == some_file_id)
-    ].index
-
-    if len(matched_indices) == 0:
-        st.warning("No exact match found in the Parquet for this anomaly.")
-    else:
-        # Suppose we just take the first match if multiple
-        matched_idx = matched_indices[0]
+        # User-set paths (adjust if needed)
+        anomalies_csv_path = "detect/detected_anomalies.csv"
+        output_csv_path = "labeled_anomalies.csv"
         
-        # --- Grab the previous 100 rows window
-        window_size = 100
-        start_idx = max(0, matched_idx - window_size)
-        df_window = parquet_df.iloc[start_idx:matched_idx+1]
+        # --- Load the anomalies CSV
+        if not os.path.exists(anomalies_csv_path):
+            st.error(f"Cannot find anomalies CSV: {anomalies_csv_path}")
+            return
         
-        st.write(f"Showing previous {window_size} rows up to index {matched_idx} in parquet:")
-        st.dataframe(df_window)
+        anomalies_df = pd.read_csv(anomalies_csv_path)
+        if anomalies_df.empty:
+            st.warning("No rows in anomalies CSV.")
+            return
+        
+        st.write("Loaded anomalies:", anomalies_df.shape)
 
-    # ------------------------------------------------------------------------------
-    # 4) Let user label as anomaly or not
-    # ------------------------------------------------------------------------------
-    user_decision = st.radio(
-        "Is this truly an anomaly?",
-        ("Unlabeled", "Yes", "No"),
-        index=0
-    )
+        # Initialize session state for labels
+        if "labels" not in st.session_state:
+            st.session_state.labels = [None] * len(anomalies_df)
+        if "current_index" not in st.session_state:
+            st.session_state.current_index = 0
 
-    # ------------------------------------------------------------------------------
-    # 5) Navigation & saving the temporary label
-    # ------------------------------------------------------------------------------
-    if st.button("Next anomaly >>"):
-        # Store user label in session state
-        # Could store as boolean or text
-        if user_decision == "Yes":
-            st.session_state.labels[idx] = True
-        elif user_decision == "No":
-            st.session_state.labels[idx] = False
+        # If we're beyond last anomaly, let user finalize
+        if st.session_state.current_index >= len(anomalies_df):
+            st.success("No more anomalies to label. You can save/export your results.")
+            if st.button("Save labeled anomalies to CSV"):
+                labeled_df = anomalies_df.copy()
+                labeled_df["user_label"] = st.session_state.labels
+                labeled_df.to_csv(output_csv_path, index=False)
+                st.success(f"Labeled anomalies saved to: {output_csv_path}")
+            return
+
+        # --------------------------------------------------------------------------
+        # Show the current anomaly
+        # --------------------------------------------------------------------------
+        idx = st.session_state.current_index
+        anomaly_row = anomalies_df.iloc[idx]
+
+        total_anomalies = len(anomalies_df)
+
+        # Extract relevant metadata
+        score = anomaly_row.get("anomaly_score", "N/A")
+        distance = anomaly_row.get("distance_from_threshold", "N/A")
+        threshold = anomaly_row.get("threshold", "N/A")
+
+        # Parse the anomaly's timestamp_str
+        timestamp_str = anomaly_row["timestamp_str"]
+        file_name = timestamp_str.split(";")[0]
+        file_id = ''.join(filter(str.isdigit, file_name))  # e.g., '155' from '155.csv'
+
+        # Sub-header with the requested format
+        st.subheader(
+            f"Anomaly #{idx+1} of {total_anomalies} from {file_id}.csv "
+        )
+
+        # We do NOT want to show timestamp_str, anomaly_score, distance_to_anomaly, threshold in the anomaly table
+        columns_to_hide = {"timestamp_str", "anomaly_score", "distance_from_threshold", "threshold"}
+        
+        # Identify the columns in the current anomaly (excluding the above)
+        anomaly_all_cols = anomaly_row.index.tolist()
+        anomaly_display_cols = [c for c in anomaly_all_cols if c not in columns_to_hide]
+
+        # Separate into original feature columns vs. prediction columns
+        orig_cols = [c for c in anomaly_display_cols if not c.endswith("_p")]
+        pred_cols = [c for c in anomaly_display_cols if c.endswith("_p")]
+
+        # Combine original and prediction columns into a single DataFrame
+        combined_df = pd.DataFrame({
+            "Original Feature Columns": anomaly_row[orig_cols].values if orig_cols else [],
+            "Prediction Columns": anomaly_row[pred_cols].values if pred_cols else []
+        })
+
+        # Add headers for original columns
+        combined_df.index = orig_cols 
+
+        # Show combined DataFrame
+        st.write("**Original Feature Columns and Prediction Columns:**")
+        st.dataframe(combined_df.T, use_container_width=True)
+
+        # --------------------------------------------------------------------------
+        # Show the window data around the matched index
+        # --------------------------------------------------------------------------
+        csv_file_path = os.path.join("data/scaled_pdsch_data", file_id + "_scaled.csv")
+        
+        if not os.path.exists(csv_file_path):
+            st.error(f"No matching CSV file found for file_id: {file_id}")
+            return
+        
+        df = pd.read_csv(csv_file_path)
+        matched_indices = df[df['timestamp_str'] == timestamp_str].index
+
+        if len(matched_indices) == 0:
+            st.warning("No exact match found in the CSV for this anomaly.")
         else:
-            st.session_state.labels[idx] = None
-        
-        # Move to next
-        st.session_state.current_index += 1
-        st.experimental_rerun()
+            matched_idx = matched_indices[0]
+            start_idx = max(0, matched_idx - WINDOW_BEFORE)
+            end_idx = min(len(df), matched_idx + WINDOW_AFTER + 1)
 
-    st.write("---")
-    st.write("**Progress**: ", f"{idx+1}/{len(anomalies_df)} labeled so far.")
+            # Create the window around the anomaly, removing timestamp_str from display
+            df_window = df.iloc[start_idx:end_idx].drop(columns=["timestamp_str"], errors="ignore")
+            df_window = unscale_features(df_window)
 
-    # Provide a button at bottom to save at any time
-    if st.button("Save partial labeling so far"):
-        labeled_df = anomalies_df.copy()
-        labeled_df["user_label"] = st.session_state.labels
-        labeled_df.to_csv(output_csv_path, index=False)
-        st.success(f"Partial results saved to: {output_csv_path}")
+            # Highlight the row of interest in the window
+            def highlight_anomaly_row(row):
+                return [
+                    'background-color: yellow' if row.name == matched_idx else ''
+                    for _ in row
+                ]
+            
+            st.write(
+                f"Showing {WINDOW_BEFORE} rows before and {WINDOW_AFTER} rows after index {matched_idx} in CSV:"
+            )
+            styled_window = df_window.style.apply(highlight_anomaly_row, axis=1)
+            st.dataframe(styled_window, use_container_width=True)
 
-# ------------------------------------------------------------------------------
+        st.write("---")
+
+    # ----------------------------------------------------------------------------
+    # Decision & labeling controls (side-by-side buttons) in col2
+    # ----------------------------------------------------------------------------
+    with col2:
+        score_placeholder.markdown(f"<h3>Score: {score:.4f}</h3>", unsafe_allow_html=True)
+        threshold_placeholder.markdown(f"<h3>Threshold: {threshold:.4f}</h3>", unsafe_allow_html=True)
+        distance_placeholder.markdown(f"<h3>Diff: {distance:.4f}</h3>", unsafe_allow_html=True)
+
+        # Two side-by-side buttons: "Anomaly" or "Normal"
+        bcol1, bcol2 = st.columns(2)
+        with bcol1:
+            if st.button("Anomaly"):
+                st.session_state.labels[idx] = True
+                # Save immediately
+                labeled_df = anomalies_df.copy()
+                labeled_df["user_label"] = st.session_state.labels
+                labeled_df.to_csv(output_csv_path, index=False)
+                # Move to next anomaly
+                st.session_state.current_index += 1
+                st.rerun()
+
+        with bcol2:
+            if st.button("Normal"):
+                st.session_state.labels[idx] = False
+                # Save immediately
+                labeled_df = anomalies_df.copy()
+                labeled_df["user_label"] = st.session_state.labels
+                labeled_df.to_csv(output_csv_path, index=False)
+                # Move to next anomaly
+                st.session_state.current_index += 1
+                st.rerun()
+
+        # Progress status
+        st.write("**Progress**: ", f"{idx+1}/{len(anomalies_df)} labeled so far.")
+
+# --------------------------------------------------------------------------
 # Streamlit entry point
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
