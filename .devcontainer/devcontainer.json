@@ -10,8 +10,8 @@
 				"Optuna.optuna-dashboard"
 			]
 		}
-	},
-	"mounts": [
-		"source=/c/Users/eranil/Documents/romes-anomaly/data/scaled_pdsch_data,target=/workspaces/thesis/data/scaled_pdsch_data,type=bind"
-	]
+	}
+	// "mounts": [
+	// 	"source=/c/Users/eranil/Documents/romes-anomaly/data/scaled_pdsch_data,target=/workspaces/thesis/data/scaled_pdsch_data,type=bind"
+	// ]
 }
