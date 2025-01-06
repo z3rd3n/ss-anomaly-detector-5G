@@ -4,8 +4,10 @@ data/scaled_pdsch_data/
 __pycache__/
 *reportable/
 *mlruns/
+*mlartifacts/
 prompt.py
 subAdjacent/results/
 results/
 *.db
 *temp/
+*temp_mlflow/

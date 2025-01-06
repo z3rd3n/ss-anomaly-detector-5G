@@ -50,7 +50,7 @@ def log_checkpoint_artifact(input_dir) -> None:
 
 def log_plots(input_dir: str) -> None:
     for file in glob.glob(os.path.join(input_dir, "*.png")):
-        artifact_path = "attention_plots" if "attention" in file else "results"
+        artifact_path = "attention_plots" if "attention" in file else "plots"
         mlflow.log_artifact(file, artifact_path)
 
 def log_log(input_dir: str) -> None:

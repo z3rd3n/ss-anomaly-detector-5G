@@ -147,4 +147,12 @@ def detect_anomalies(params, model, val_loader):
     # Sort by anomaly_score desc
     anomalies_df = anomalies_df.sort_values("anomaly_score", ascending=False)
     logging.info(f"Found {len(anomalies_df)} anomalies out of {len(all_scores)} data points.")
-    return anomalies_df
+
+    fig, ax = plt.subplots()
+    ax.plot(all_scores, label="scores")
+    ax.axhline(threshold, color='red', label=f"Threshold (p={params.p}, q={params.q})")
+    ax.legend()
+    fig_path = f"{params.output_dir}_p{params.p}q{str(params.q)[-2:]}.png"
+    fig.savefig(fig_path)
+    plt.close(fig)
+    return anomalies_df, fig_path

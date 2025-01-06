@@ -107,8 +107,8 @@ def plot_attention_matrices(
     model, 
     dataloader, 
     device="cpu", 
-    max_plots=2, 
-    max_heads=2, 
+    max_plots=8, 
+    max_heads=4, 
     sample_idx=0
 ):
     """
