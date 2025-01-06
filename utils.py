@@ -72,22 +72,16 @@ def save_checkpoint(model, optimizer, epoch, loss, params):
         logging.info(f"Learning Rate: {params.learning_rate}")
 
 
-def load_checkpoint(model, optimizer, output_dir):
-    checkpoint_dir = os.path.join(output_dir, 'checkpoints')
-    os.makedirs(checkpoint_dir, exist_ok=True)  # Creates the directory if it doesn't exist
-
-    # Define the checkpoint file path
-    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
-
+def load_checkpoint(model, optimizer, checkpoint_path):
+    """
+    Helper to load a checkpoint from checkpoint_path into model/optimizer
+    """
+    logging.info(f"Loading checkpoint from {checkpoint_path} ...")
     device = next(model.parameters()).device
-    checkpoint = torch.load(checkpoint_path, map_location= "cuda" if torch.cuda.is_available() else "cpu", weights_only=True)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
-
-    logging.info(f"Loaded checkpoint from epoch {epoch+1} with loss {loss:.4f}")
-    return epoch, loss
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    logging.info("Checkpoint loaded.")
 
 
 def plot_training_curves(train_losses, val_losses, output_dir):
@@ -112,114 +106,107 @@ def plot_training_curves(train_losses, val_losses, output_dir):
 def plot_attention_matrices(
     model, 
     dataloader, 
-    device, 
-    output_dir, 
-    max_plots=5,   # how many batches you want to visualize
-    max_heads=12,    # how many heads per batch you want to plot
-    sample_idx=16    # which sample in the batch to visualize
+    device="cpu", 
+    max_plots=2, 
+    max_heads=2, 
+    sample_idx=0
 ):
     """
-    Plots multi-head attention from the last encoder layer.
-    
-    Args:
-        model: your model with a forward() returning queries_list, keys_list.
-        dataloader: the DataLoader providing (features, etc).
-        device: the device ('cpu' or 'cuda') to use.
-        output_dir: where to save the generated plots.
-        max_plots: number of batches to plot from the dataloader.
-        max_heads: how many heads to visualize per batch.
-        sample_idx: which sample in the batch we want to plot.
+    Returns a list of (title_string, figure) for each attention matrix plot.
+    We won't save to disk. We'll just generate them so we can show them in Streamlit.
     """
-    model.eval()
-    os.makedirs(output_dir, exist_ok=True)
+    import math
 
+    model.to(device)
+    model.eval()
+    plots = []
+    batch_count = 0
+    
     for batch_idx, batch in enumerate(dataloader):
         if batch_idx >= max_plots:
-            break  # stop if we already plotted enough
-
-        features = batch['features'].to(device)  # shape [B, L, D]
+            break
+        features = batch["features"].to(device)
         with torch.no_grad():
-            # The model returns something like enc_out, [queries_per_layer], [keys_per_layer]
-            _, queries_list, keys_list = model(features)
-
-        queries = torch.stack(queries_list, dim=0).mean(dim=0) # shape [B, L, H, d_k]
-        keys = torch.stack(keys_list, dim=0).mean(dim=0) # shape [B, L, H, d_k]
+            enc_out, queries_list, keys_list = model(features)
         
-        # We'll visualize a single sample in the batch: sample_idx
-        # queries_0 shape => [L, H, d_k]
-        queries_0 = queries[sample_idx]  # shape [L, H, d_k]
-        keys_0 = keys[sample_idx]        # shape [L, H, d_k]
+        # For demonstration, let's say we just take the last layer's queries/keys:
+        # queries shape [B, L, H, D], keys shape [B, L, H, D]
+        if not queries_list:
+            logging.warning("queries_list is empty, skipping attention plotting.")
+            break
+        queries = queries_list[-1]  # shape [B, L, H, D]
+        keys = keys_list[-1]        # shape [B, L, H, D]
+        if sample_idx >= queries.shape[0]:
+            # skip if sample_idx not available
+            logging.warning(f"sample_idx={sample_idx} out of range for this batch, skipping.")
+            continue
+        
+        # Extract single sample
+        q_0 = queries[sample_idx]  # [L, H, D]
+        k_0 = keys[sample_idx]     # [L, H, D]
+        # rearr => [H, L, D]
+        q_0 = q_0.permute(1,0,2)
+        k_0 = k_0.permute(1,0,2)
+        # Compute attention per head => Q * K^T
+        d_k = q_0.size(-1)
+        scale = 1.0 / (d_k ** 0.5)
+        attn_matrices = torch.bmm(q_0, k_0.transpose(1,2)) * scale
+        attn_matrices = torch.softmax(attn_matrices, dim=-1)  # [H, L, L]
 
-        # Permute so each head is first: [H, L, d_k]
-        queries_0 = queries_0.permute(1, 0, 2)  # => [H, L, d_k]
-        keys_0 = keys_0.permute(1, 0, 2)        # => [H, L, d_k]
-
-        # Now compute attention for each head: 
-        # attention = Q * K^T => shape [H, L, L]
-        # Usually we do scale = 1 / sqrt(d_k).
-        d_k = queries_0.size(-1)
-        scale = 1.0 / (d_k**0.5)
-        attn_matrices = torch.bmm(queries_0, keys_0.transpose(1, 2))  # => [H, L, L]
-        attn_matrices = attn_matrices * scale
-        attn_matrices = torch.softmax(attn_matrices, dim=-1)          # => [H, L, L]
-
-        # Plot up to max_heads heads
+        # We'll plot up to max_heads
         num_heads = min(attn_matrices.size(0), max_heads)
-        num_cols = 4
-        num_rows = (num_heads + num_cols - 1) // num_cols  # ceiling division
+        num_cols = 2
+        num_rows = math.ceil(num_heads / num_cols)
         fig, axes = plt.subplots(
             nrows=num_rows,
             ncols=num_cols,
-            figsize=(4*num_cols, 4*num_rows),  # wide enough for each head
+            figsize=(5*num_cols, 5*num_rows),
             squeeze=False
         )
+        fig.suptitle(f"Batch {batch_idx}, Sample {sample_idx}, {num_heads} heads")
 
         for h in range(num_heads):
-            attn_head_h = attn_matrices[h]  # shape [L, L]
-            row = h // num_cols
-            col = h % num_cols
-            ax = axes[row, col]
-            im = ax.imshow(
-            attn_head_h.cpu().numpy(),
-            cmap='hot',
-            interpolation='nearest',
-            aspect='auto'
-            )
-            ax.set_title(f"Batch {batch_idx}, Sample {sample_idx}, Head {h}")
+            attn_head_h = attn_matrices[h].cpu().numpy()
+            r = h // num_cols
+            c = h % num_cols
+            ax = axes[r, c]
+            im = ax.imshow(attn_head_h, cmap="hot", aspect="auto")
+            ax.set_title(f"Head {h}")
             ax.set_xlabel("Key positions")
             ax.set_ylabel("Query positions")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.colorbar(im, ax=ax)
+        
+        # Hide any extra subplots if heads < num_rows*num_cols
+        for h in range(num_heads, num_rows*num_cols):
+            r = h // num_cols
+            c = h % num_cols
+            fig.delaxes(axes[r, c])
 
-        # Hide any unused subplots
-        for h in range(num_heads, num_rows * num_cols):
-            fig.delaxes(axes.flatten()[h])
-
-        fig.tight_layout()
-        save_path = os.path.join(output_dir, f"attention_batch{batch_idx}_sample{sample_idx}.png")
-        plt.savefig(save_path, dpi=150)
-        plt.close(fig)
-        logging.info(f"Saved attention matrix to {save_path}")
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        plots.append((f"Attention Batch{batch_idx}_Sample{sample_idx}", fig))
+        batch_count += 1
+    
+    return plots
 
 
-def plot_anomalies(all_scores, anomalies_mask, threshold, output_dir):
+def plot_anomaly_scores(scores, threshold):
     """
-    Plots the anomaly score over sample index, highlighting anomalies above threshold.
+    Returns (title_string, figure) for anomaly scores.
     """
-    fig, ax = plt.subplots(figsize=(6,4))
-    idx = np.arange(len(all_scores))
-    ax.plot(idx, all_scores, label='Anomaly Score')
+    fig, ax = plt.subplots(figsize=(7, 3))
+    idx = np.arange(len(scores))
+    ax.plot(idx, scores, label="Anomaly Score")
     ax.axhline(threshold, color='r', linestyle='--', label=f'Threshold={threshold:.2f}')
+    
     # highlight anomalies
-    ax.scatter(idx[anomalies_mask], all_scores[anomalies_mask], color='red', s=10, label='Detected Anomalies')
-    ax.set_title('Anomaly Scores (Validation Set)')
-    ax.set_xlabel('Index')
-    ax.set_ylabel('Score')
+    anomalies_mask = scores > threshold
+    ax.scatter(idx[anomalies_mask], scores[anomalies_mask], color='red', s=10, label='Detected Anomalies')
+    ax.set_title("Anomaly Scores")
+    ax.set_xlabel("Index")
+    ax.set_ylabel("Score")
     ax.legend()
     fig.tight_layout()
-    save_path = os.path.join(output_dir, 'anomaly_scores.png')
-    plt.savefig(save_path)
-    plt.close(fig)
-    logging.info(f"Saved anomaly score plot to {save_path}")
+    return ("Anomaly Scores", fig)
 
 def unscale_features(features):
     scaler_json_path = "data/scaling_params.json"

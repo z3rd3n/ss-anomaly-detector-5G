@@ -67,12 +67,49 @@ def log_anomalies(input_dir: str) -> None:
 def end_mlflow_run() -> None:
     mlflow.end_run()
 
-def download_artifact(run_id: str, artifact_path: str, dst_path: str = None) -> str:
+def download_artifact(run_id, artifact_path, dst_path="."):
     """
-    Downloads an artifact (model/checkpoint) from MLflow to a local directory.
-    Returns the local path where the file is downloaded.
+    Downloads an artifact from MLflow given run_id and artifact_path,
+    saving under dst_path. Returns the local path to the downloaded artifact folder.
     """
+    logging.info(f"Downloading artifact '{artifact_path}' from run_id '{run_id}' to '{dst_path}'")
     client = MlflowClient()
-    local_path = client.download_artifacts(run_id, artifact_path, dst_path or ".")
-    logging.info(f"Downloaded artifact {artifact_path} to local path: {local_path}")
+    local_path = client.download_artifacts(run_id, artifact_path, dst_path)
     return local_path
+
+
+def load_config_from_mlflow(run_id, temp_dir):
+    """
+    Download config_class.py from MLflow and import it dynamically.
+    This function assumes the config_class is in `config_class.py`.
+    
+    We'll place it into `temp_dir/config_class.py`, 
+    then import it with an importlib trick, and return the Config object.
+    """
+    import importlib.util
+    config_py_path = download_artifact(run_id, "configClass.py", temp_dir)
+    # The MLflow artifact might place it in e.g. {temp_dir}/approaches/subAdjacent/configClass.py
+    # We'll attempt to import from that path.
+
+    # Find a matching Python file
+    if os.path.isfile(config_py_path):
+        # config_py_path is already the python file
+        pass
+    else:
+        # Possibly the artifact was placed in a folder; we have to find the .py inside
+        for root, dirs, files in os.walk(config_py_path):
+            for f in files:
+                if f == "configClass.py":
+                    config_py_path = os.path.join(root, f)
+                    break
+
+    if not os.path.isfile(config_py_path):
+        raise FileNotFoundError(f"configClass.py not found inside MLflow artifacts for run_id={run_id}")
+
+    spec = importlib.util.spec_from_file_location("config_module", config_py_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    # Now we have config_module, which presumably has a class "Config"
+
+    # Return the class, let user instantiate
+    return config_module.Config

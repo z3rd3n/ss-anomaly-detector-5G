@@ -83,9 +83,7 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
     logging.info("Training finished.")
 
 
-def detect_anomalies(params, model, optimizer, val_loader, mlflow=False):
-    if not mlflow:
-        load_checkpoint(model, optimizer, params.output_dir)
+def detect_anomalies(params, model, val_loader):
     
     model.eval()
     all_preds= []
@@ -117,26 +115,36 @@ def detect_anomalies(params, model, optimizer, val_loader, mlflow=False):
             all_preds.append(enc_out.cpu().numpy())
             all_timestamps.extend([t for sublist in timestamps for t in sublist])
 
-    train_attn_array = np.concatenate(train_energy, axis=0).reshape(-1)
+    all_scores = np.concatenate(train_energy, axis=0).reshape(-1)
     all_features = np.concatenate(all_features, axis=0).reshape(-1, len(params.feature_columns))
     all_preds = np.concatenate(all_preds, axis=0).reshape(-1, len(params.feature_columns))
    
     # Calculate threshold using EVT
-    threshold = calculate_threshold_evt(train_attn_array, params.q, params.p)
-    anomalies_mask = train_attn_array > threshold
+    threshold = calculate_threshold_evt(all_scores, params.q, params.p)
+    logging.info(f"Threshold derived from q={params.q}, p={params.p} => {threshold:.4f}")
     
-    # Save results
-    unscale_and_save_anomalies(
-        timestamps=all_timestamps,
-        features=all_features,
-        enc_outputs=all_preds,
-        anomaly_scores=train_attn_array,
-        threshold=threshold,
-        output_csv=os.path.join(params.output_dir, "detected_anomalies.csv")
-    )
+    anomalies_mask = all_scores > threshold
+    # Build a DataFrame of anomalies
+    anomalies_list = []
+    for idx, is_anom in enumerate(anomalies_mask):
+        if is_anom:
+            row_dict = {
+                "timestamp_str": all_timestamps[idx],
+                "anomaly_score": all_scores[idx],
+                "distance_from_threshold": all_scores[idx] - threshold,
+                "threshold": threshold,
+            }
 
-    # Visualizations
-    plot_anomalies(train_attn_array, anomalies_mask, threshold, params.output_dir)
-    plot_attention_matrices(model, val_loader, params.device, params.output_dir)
-    
-    logging.info("Anomaly detection complete.")
+            unscaled = unscale_features(all_features[idx:idx+1, :])[0]
+            unscaled_p = unscale_features(all_preds[idx:idx+1, :])[0]
+            # Just label them as col, col_p
+            for i, feat_name in enumerate(params.feature_columns):
+                row_dict[f"{feat_name}"] = unscaled[i]
+                row_dict[f"{feat_name}_p"] = unscaled_p[i]
+            anomalies_list.append(row_dict)
+
+    anomalies_df = pd.DataFrame(anomalies_list)
+    # Sort by anomaly_score desc
+    anomalies_df = anomalies_df.sort_values("anomaly_score", ascending=False)
+    logging.info(f"Found {len(anomalies_df)} anomalies out of {len(all_scores)} data points.")
+    return anomalies_df
