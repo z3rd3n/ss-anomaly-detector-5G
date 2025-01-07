@@ -9,6 +9,7 @@ if BASE_DIR not in sys.path:
 from subAdjacent.run_epoch import train_one_epoch, validate_one_epoch
 from utils import *
 from tqdm import tqdm
+import ptvsd
 
 
 def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
@@ -84,17 +85,20 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
 
 
 def detect_anomalies(params, model, val_loader):
+
+    #load_checkpoint(model, None, "/workspaces/thesis/detect/reportable/results/checkpoints/checkpoint_best.pt")
     
     model.eval()
+    train_energy = []
     all_preds= []
     all_features = []
     all_timestamps = []
     criterion_mse = torch.nn.MSELoss(reduction='none')
     softmax = torch.nn.Softmax(dim=-1)
 
+
     with torch.no_grad():
-        train_energy = []
-        for batch in tqdm(val_loader, desc="Detecting anomalies"):
+        for i, batch in enumerate(tqdm(val_loader, desc="Detecting anomalies")):
             features = batch['features'].to(params.device)
             timestamps = batch['timestamps']
             
@@ -115,44 +119,66 @@ def detect_anomalies(params, model, val_loader):
             all_preds.append(enc_out.cpu().numpy())
             all_timestamps.extend([t for sublist in timestamps for t in sublist])
 
-    all_scores = np.concatenate(train_energy, axis=0).reshape(-1)
+    train_energy = np.concatenate(train_energy, axis=0).reshape(-1)
+    print(f"train_energy has length {len(train_energy)} and stats: "
+             f"min={train_energy.min() if len(train_energy) else None}, "
+             f"max={train_energy.max() if len(train_energy) else None}, "
+             f"mean={train_energy.mean() if len(train_energy) else None}")
     all_features = np.concatenate(all_features, axis=0).reshape(-1, len(params.feature_columns))
     all_preds = np.concatenate(all_preds, axis=0).reshape(-1, len(params.feature_columns))
    
     # Calculate threshold using EVT
-    threshold = calculate_threshold_evt(all_scores, params.q, params.p)
-    logging.info(f"Threshold derived from q={params.q}, p={params.p} => {threshold:.4f}")
+    threshold = calculate_threshold_evt(train_energy, params.q, params.p)
+    print(f"Threshold derived from q={params.q}, p={params.p} => {threshold:.4f}")
     
-    anomalies_mask = all_scores > threshold
-    # Build a DataFrame of anomalies
-    anomalies_list = []
-    for idx, is_anom in enumerate(anomalies_mask):
-        if is_anom:
-            row_dict = {
-                "timestamp_str": all_timestamps[idx],
-                "anomaly_score": all_scores[idx],
-                "distance_from_threshold": all_scores[idx] - threshold,
-                "threshold": threshold,
-            }
+    anomaly_indices = np.where(train_energy >= threshold)[0]
+    logging.info(f"Total anomaly count: {len(anomaly_indices)} from {len(train_energy)} ratio {len(anomaly_indices)/len(train_energy)} (threshold={threshold})")
 
-            unscaled = unscale_features(all_features[idx:idx+1, :])[0]
-            unscaled_p = unscale_features(all_preds[idx:idx+1, :])[0]
-            # Just label them as col, col_p
-            for i, feat_name in enumerate(params.feature_columns):
-                row_dict[f"{feat_name}"] = unscaled[i]
-                row_dict[f"{feat_name}_p"] = unscaled_p[i]
-            anomalies_list.append(row_dict)
+    if len(anomaly_indices) > 0:
+        unscaled = unscale_features(all_features[anomaly_indices,:])
+        predicted = unscale_features(all_preds[anomaly_indices,:])
+        anomalies = pd.DataFrame({
+            'timestamp_str': [all_timestamps[i] for i in anomaly_indices],
+            'SFN': unscaled[:, 0].astype(int),
+            'SFN_p': predicted[:, 0].astype(int),
+            'Slot': unscaled[:, 1].astype(int),
+            'Slot_p': predicted[:, 1].astype(int),
+            'CC': unscaled[:, 2].astype(int),
+            'CC_p': predicted[:, 2].astype(int),
+            'HARQ': unscaled[:, 3].astype(int),
+            'HARQ_p': predicted[:, 3].astype(int),
+            'MCS': unscaled[:, 4].astype(int),
+            'MCS_p': predicted[:, 4].astype(int),
+            'CRC': unscaled[:, 5].astype(int),
+            'CRC_p': predicted[:, 5].astype(int),
+            'ReTx': unscaled[:, 6].astype(int),
+            'ReTx_p': predicted[:, 6].astype(int),
+            'NDI': unscaled[:, 7].astype(int),
+            'NDI_p': predicted[:, 7].astype(int),
+            'threshold': threshold,
+            'anomaly_score': train_energy[anomaly_indices],  # Add anomaly scores,
+            'distance_from_threshold': (train_energy[anomaly_indices] - threshold)
+        })
+        
+        # Sort by anomaly score in descending order
+        anomalies_df = anomalies.sort_values('anomaly_score', ascending=False)
+        logging.info("Anomalies detected.")
+        #anomalies_df.to_csv(f"{params.output_dir}_p{params.p}q{str(params.q)[-2:]}.csv", index=False)
 
-    anomalies_df = pd.DataFrame(anomalies_list)
+    if anomalies_df.empty:
+        logging.warning("No anomalies found (empty DataFrame).")
+        assert len(train_energy) == 0, "If anomalies_df is empty, all_scores should be empty too."
+    else:
+        anomalies_df = anomalies_df.sort_values("anomaly_score", ascending=False)
+        logging.info(f"Found {len(anomalies_df)} anomalies.")
     # Sort by anomaly_score desc
     anomalies_df = anomalies_df.sort_values("anomaly_score", ascending=False)
-    logging.info(f"Found {len(anomalies_df)} anomalies out of {len(all_scores)} data points.")
+    logging.info(f"Found {len(anomalies_df)} anomalies out of {len(train_energy)} data points.")
 
     fig, ax = plt.subplots()
-    ax.plot(all_scores, label="scores")
+    ax.plot(train_energy, label="scores")
     ax.axhline(threshold, color='red', label=f"Threshold (p={params.p}, q={params.q})")
-    ax.legend()
-    fig_path = f"{params.output_dir}_p{params.p}q{str(params.q)[-2:]}.png"
+    fig_path = os.path.join(params.output_dir, f"anomalies_p{params.p}q{str(params.q)[-2:]}.png")
     fig.savefig(fig_path)
     plt.close(fig)
     return anomalies_df, fig_path

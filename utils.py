@@ -8,6 +8,7 @@ import torch
 from datetime import datetime
 from scipy import stats
 import pandas as pd
+from scipy.signal import find_peaks
 
 
 def start_logging(params=None, approach=None):
@@ -80,7 +81,8 @@ def load_checkpoint(model, optimizer, checkpoint_path):
     device = next(model.parameters()).device
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     logging.info("Checkpoint loaded.")
 
 

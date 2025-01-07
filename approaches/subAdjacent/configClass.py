@@ -9,12 +9,12 @@ class Config:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        self.train = True
+        self.train = False
         self.detect = True
-        self.seq_len = 50
+        self.seq_len = 25
         self.stride = None
         self.batch_size = 32
-        self.num_epochs = 100
+        self.num_epochs = 15
         self.validation_ratio=0.2
         self.learning_rate = 1e-4
 
@@ -36,15 +36,15 @@ class Config:
         self.output_dir = results_dir
 
         # Model architecture params
-        self.model_dim = 256       # d_model
+        self.model_dim = 512       # d_model
         self.n_heads = 8          # number of attention heads
-        self.e_layers = 4         # number of encoder layers
+        self.e_layers = 2         # number of encoder layers
         self.activation = 'gelu'  # activation function
         self.k_value = 10        # trade-off parameter for loss
         self.lamda_rec = 2
-        self.negative_qk = True
-        self.dropout = 0.5
-        self.span = [10,20]
+        self.negative_qk = False
+        self.dropout = 0.4
+        self.span = [12, 18]
         self.one_side = False
         self.max_grad_norm = 5.0
 
@@ -54,7 +54,7 @@ class Config:
 
         # EVT params
         self.p = 95 # percentile
-        self.q = 0.99 # quantile
+        self.q = 0.95 # quantile
 
         # System params
         self.num_workers = 0

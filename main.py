@@ -69,10 +69,9 @@ def main(params, train_func, detect_func):
         )
     if params.detect:
         logging.info("Starting detection...")
-        detect_func(
+        a, b = detect_func(
             params, 
             model, 
-            optimizer,
             val_loader, 
         )
 

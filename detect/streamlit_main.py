@@ -1,4 +1,4 @@
-import os
+import os 
 import logging
 import streamlit as st
 import pandas as pd
@@ -9,6 +9,13 @@ from torch.utils.data import DataLoader
 import sys
 import json
 from mlflow.tracking import MlflowClient
+
+# --- Ensure the session_state variables exist before using them ---
+if "detect_path" not in st.session_state:
+    st.session_state.detect_path = ""
+
+if "labeled_path" not in st.session_state:
+    st.session_state.labeled_path = ""
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  
 if BASE_DIR not in sys.path:
@@ -76,7 +83,7 @@ def app_main():
             value="http://localhost:8000",
             help="Must be http(s) if using mlflow-artifacts store"
         )
-        run_id = st.text_input("Enter MLflow run_id:", value="595c7686c17a4926b81ab7175b44e63b", help="Paste the run_id from MLflow")
+        run_id = st.text_input("Enter MLflow run_id:", value="809606034f6e4682b2f327d249eff203", help="Paste the run_id from MLflow")
         if st.button("Load Model & Config from MLflow"):
             if not run_id:
                 st.error("Please provide a run_id.")
@@ -91,7 +98,8 @@ def app_main():
                     ConfigClass = load_config_from_mlflow(run_id, st.session_state.temp_dir)
                     st.session_state.params = ConfigClass()
                     st.session_state.params.output_dir = st.session_state.temp_dir
-                    # 3) Download checkpoint
+
+                    # 2) Download checkpoint
                     ckpt_path = download_artifact(run_id, "checkpoints/checkpoint_best.pt", st.session_state.temp_dir)
                     mlflow.set_tracking_uri(tracking_uri)
                     # If the run is known to be in subAdjacent, do this
@@ -100,8 +108,10 @@ def app_main():
                     # Only do this once:
                     if mlflow.active_run() is None:
                         mlflow.start_run(run_id=run_id)
-                    # 4) Build model from the config
+
+                    # 3) Build model from the config
                     st.session_state.model = st.session_state.params.build_model()
+
                     # Build optimizer
                     if hasattr(st.session_state.params, "optimizer") and st.session_state.params.optimizer == "AdamW":
                         st.session_state.optimizer = torch.optim.AdamW(
@@ -114,9 +124,9 @@ def app_main():
                             st.session_state.model.parameters(),
                             lr=st.session_state.params.learning_rate
                         )
-                    # 5) Load checkpoint
-                    load_checkpoint(st.session_state.model, st.session_state.optimizer, ckpt_path)
                     
+                    # 4) Load checkpoint
+                    load_checkpoint(st.session_state.model, st.session_state.optimizer, ckpt_path)
                     
                     st.success("Model & config loaded from MLflow. Params updated.")
                     st.write("Current parameters:")
@@ -134,9 +144,20 @@ def app_main():
             st.subheader("Run Anomaly Detection with custom p and q")
             p_val = st.number_input("Percentile (p)", min_value=0, max_value=100, value=95, step=1)
             q_val = st.number_input("Quartile (q)", min_value=0.0, max_value=1.0, value=0.99, step=0.01)
-            st.session_state.params.q = p_val
-            st.session_state.params.p = q_val
+            st.session_state.params.q = q_val
+            st.session_state.params.p = p_val
+            
+            # Construct detect/labeled paths inside the chosen output_dir
+            st.session_state.detect_path = os.path.join(
+                st.session_state.params.output_dir, 
+                f"anomalies_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}.csv"
+            )
+            st.session_state.labeled_path = os.path.join(
+                st.session_state.params.output_dir, 
+                f"labeled_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}.csv"
+            )
 
+            # Create validation dataset & loader
             _, val_dataset = ParquetSequenceDataset.create_train_val_splits(
                 parquet_path=st.session_state.params.parquet_path,
                 feature_columns=st.session_state.params.feature_columns,
@@ -158,17 +179,17 @@ def app_main():
 
             if st.button("Run Anomaly Detection"):
                 with st.spinner("Running detection..."):
-                    logging.info("Creating train and validation datasets...")
+                    # If old CSVs exist, warn & remove them
+                    if os.path.exists(st.session_state.detect_path):
+                        st.warning(f"Anomalies CSV {st.session_state.detect_path} already exists. Overwriting.")
+                        os.remove(st.session_state.detect_path)
 
-                    if os.path.exists("temp_mlflow/detected_anomalies.csv"):
-                        st.warning("Anomalies CSV already exists. Overwriting.")
-                        os.remove("temp_mlflow/detected_anomalies.csv")
+                    if os.path.exists(st.session_state.labeled_path):
+                        st.warning(f"Labeled anomalies CSV {st.session_state.labeled_path} already exists. Overwriting.")
+                        os.remove(st.session_state.labeled_path) 
 
-                    if os.path.exists("temp_mlflow/labeled_anomalies.csv"):
-                        st.warning("Labeled anomalies CSV already exists. Overwriting.")
-                        os.remove("temp_mlflow/labeled_anomalies.csv") 
-
-                    anomalies_df, fig_path = detect_anomalies(
+                    # Actual detection
+                    anomalies_df, fig_path, peak_plots = detect_anomalies(
                         params=st.session_state.params, 
                         model=st.session_state.model, 
                         val_loader=val_loader
@@ -177,19 +198,12 @@ def app_main():
                     # Add user_label column
                     anomalies_df["user_label"] = None
 
-                    # Save to CSV
-                    output_csv = "temp_mlflow/detected_anomalies.csv"
-                    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-                    anomalies_df.to_csv(output_csv, index=False)
-                    st.success(f"Anomalies saved to {output_csv}")
-
-                    # Log final q, p, plus number of anomalies found
-                    mlflow.log_param("final_q", q_val)
-                    mlflow.log_param("final_p", p_val)
-                    mlflow.log_metric("num_anomalies", len(anomalies_df))
+                    # Save anomalies
+                    anomalies_df.to_csv(st.session_state.detect_path, index=False)
+                    st.success(f"Anomalies saved to {st.session_state.detect_path}")
 
                     # Also log the anomalies CSV to MLflow
-                    mlflow.log_artifact(output_csv, artifact_path="detection_results", run_id=run_id)
+                    mlflow.log_artifact(st.session_state.detect_path, artifact_path="detection_results", run_id=run_id)
 
                     # Log the anomaly scores figure if it exists
                     if fig_path and os.path.exists(fig_path):
@@ -200,22 +214,20 @@ def app_main():
 
             st.write("---")
             # ------  Labeling UI  ------
-            anomalies_csv_path = "temp_mlflow/detected_anomalies.csv"
-            if not os.path.exists(anomalies_csv_path):
+            if not os.path.exists(st.session_state.detect_path):
                 st.warning("No anomalies CSV found. Please run anomaly detection first.")
             else:
-                anomalies_df = pd.read_csv(anomalies_csv_path)
+                anomalies_df = pd.read_csv(st.session_state.detect_path)
                 if "user_label" not in anomalies_df.columns:
                     anomalies_df["user_label"] = None
                 if anomalies_df.empty:
                     st.warning("No rows in anomalies CSV.")
                 else:
-                    st.write(f"Loaded {len(anomalies_df)} anomalies from {anomalies_csv_path} for labeling.")
+                    st.write(f"Loaded {len(anomalies_df)} anomalies from {st.session_state.detect_path} for labeling.")
                     
                     # Merge with existing labeled anomalies if it exists
-                    labeled_csv_path = "temp_mlflow/labeled_anomalies.csv"
-                    if os.path.exists(labeled_csv_path):
-                        labeled_previous = pd.read_csv(labeled_csv_path)
+                    if os.path.exists(st.session_state.labeled_path):
+                        labeled_previous = pd.read_csv(st.session_state.labeled_path)
                         if "user_label" in labeled_previous.columns:
                             # Merge on e.g. 'timestamp_str' + 'anomaly_score'
                             anomalies_df = anomalies_df.merge(
@@ -244,7 +256,7 @@ def app_main():
                         # Convert to a dict of dataframes
                         anomaly_groups = {nid: g.reset_index(drop=True) for nid, g in grouped}
 
-                        # Initialize session state
+                        # Initialize session_state
                         if "labeled_groups" not in st.session_state:
                             st.session_state.labeled_groups = anomaly_groups
                         if "file_ids_in_order" not in st.session_state:
@@ -255,11 +267,8 @@ def app_main():
                             st.session_state.anomaly_idx = 0
 
                         # --------------------------------------------------------------------------------
-                        # (Modification #2) 
-                        # If labeling is already partially done, jump to the first unlabeled entry
-                        # so that labeling continues from the next unlabeled row.
+                        # Jump to the first unlabeled entry in the entire dataset
                         found_unlabeled = False
-                        # If there's no unlabeled row at all in the entire dataset, we'll skip everything
                         for i, fid in enumerate(st.session_state.file_ids_in_order):
                             df_fid = st.session_state.labeled_groups[fid]
                             unlabeled_indices = df_fid[df_fid["user_label"].isna()].index
@@ -275,21 +284,21 @@ def app_main():
 
                         def save_labeled_anomalies():
                             """
-                            Gather all labeled groups from session state and save
-                            to labeled_anomalies.csv.
+                            Gather all labeled groups from session_state and save
+                            to the labeled CSV.
                             """
                             all_dfs = []
                             for fid in st.session_state.labeled_groups:
                                 all_dfs.append(st.session_state.labeled_groups[fid])
                             labeled_all = pd.concat(all_dfs, ignore_index=True)
-                            labeled_all.to_csv("temp_mlflow/labeled_anomalies.csv", index=False)
+                            labeled_all.to_csv(st.session_state.labeled_path, index=False)
 
                         # If we've labeled all files, show a success
                         if st.session_state.file_idx >= len(st.session_state.file_ids_in_order):
                             st.success("No more anomalies to label! All files have been processed.")
                             if st.button("Save labeled anomalies to CSV"):
                                 save_labeled_anomalies()
-                                st.success("Labeled anomalies saved to temp_mlflow/labeled_anomalies.csv.")
+                                st.success(f"Labeled anomalies saved to {st.session_state.labeled_path}.")
                             return
 
                         current_file_id = st.session_state.file_ids_in_order[st.session_state.file_idx]
@@ -399,7 +408,6 @@ def app_main():
                             st.write("---")
                             anomaly_button = st.button("Mark ANOMALY")
                             normal_button = st.button("Mark NORMAL")
-                            # (Modification #7) Rename partial save button to "Save to MLflow"
                             partial_save_button = st.button("Save to MLflow")
 
                             if anomaly_button:
@@ -422,7 +430,7 @@ def app_main():
                                 st.session_state.labeled_groups[current_file_id] = current_df
                                 save_labeled_anomalies()
                                 # Also log to MLflow
-                                mlflow.log_artifact("temp_mlflow/labeled_anomalies.csv", artifact_path="labeled_results", run_id=run_id)
+                                mlflow.log_artifact(st.session_state.labeled_path, artifact_path="labeled_results", run_id=run_id)
                                 st.success("Labels saved to MLflow.")
 
                         st.session_state.labeled_groups[current_file_id] = current_df
@@ -460,7 +468,12 @@ def app_main():
                                 st.write(title)
                                 st.pyplot(fig)
                                 # Save each fig
-                                fig_name = f"{title.replace(' ', '_')}_q_{str(st.session_state.params.q)[-2:]}_p_{st.session_state.params.p}_h_{st.session_state.params.n_heads}.png"
+                                fig_name = (
+                                    f"{title.replace(' ', '_')}"
+                                    f"_q_{str(st.session_state.params.q)[-2:]}"
+                                    f"_p_{st.session_state.params.p}"
+                                    f"_h_{st.session_state.params.n_heads}.png"
+                                )
                                 fig_path = os.path.join(st.session_state.params.output_dir, fig_name)
                                 fig.savefig(fig_path)
                                 plt.close(fig)
@@ -471,14 +484,13 @@ def app_main():
     # ------------------- TAB 3: Highest Score Anomalies -----------------------
     with tabs[3]:
         st.header("Highest Score Anomalies")
-        st.write("Displays a configurable top-N anomalies from your detected_anomalies.csv (by anomaly_score).")
+        st.write(f"Displays a configurable top-N anomalies from your {st.session_state.detect_path}(by anomaly_score).")
         topN = st.number_input("How many top anomalies to show:", min_value=1, max_value=10000, value=10)
         
-        anomalies_csv_path = "temp_mlflow/detected_anomalies.csv"
-        if not os.path.exists(anomalies_csv_path):
+        if not os.path.exists(st.session_state.detect_path):
             st.warning("No anomalies CSV found. Please run detection first.")
         else:
-            anomalies_df = pd.read_csv(anomalies_csv_path)
+            anomalies_df = pd.read_csv(st.session_state.detect_path)
             if anomalies_df.empty:
                 st.warning("No rows in anomalies CSV.")
             else:
