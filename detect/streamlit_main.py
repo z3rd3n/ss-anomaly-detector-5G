@@ -146,16 +146,18 @@ def app_main():
             q_val = st.number_input("Quartile (q)", min_value=0.0, max_value=1.0, value=0.99, step=0.01)
             st.session_state.params.q = q_val
             st.session_state.params.p = p_val
+            #st.session_state.params.validation_ratio = 0.9
             
             # Construct detect/labeled paths inside the chosen output_dir
             st.session_state.detect_path = os.path.join(
                 st.session_state.params.output_dir, 
-                f"anomalies_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}.csv"
+                f"anomalies_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}v{int(st.session_state.params.validation_ratio * 100)}.csv"
             )
             st.session_state.labeled_path = os.path.join(
                 st.session_state.params.output_dir, 
-                f"labeled_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}.csv"
+                f"labeled_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}v{int(st.session_state.params.validation_ratio * 100)}.csv"
             )
+
 
             # Create validation dataset & loader
             _, val_dataset = ParquetSequenceDataset.create_train_val_splits(
@@ -189,7 +191,7 @@ def app_main():
                         os.remove(st.session_state.labeled_path) 
 
                     # Actual detection
-                    anomalies_df, fig_path, peak_plots = detect_anomalies(
+                    anomalies_df, fig_path = detect_anomalies(
                         params=st.session_state.params, 
                         model=st.session_state.model, 
                         val_loader=val_loader
@@ -472,6 +474,7 @@ def app_main():
                                     f"{title.replace(' ', '_')}"
                                     f"_q_{str(st.session_state.params.q)[-2:]}"
                                     f"_p_{st.session_state.params.p}"
+                                    f"_v_{int(st.session_state.params.validation_ratio * 100)}"
                                     f"_h_{st.session_state.params.n_heads}.png"
                                 )
                                 fig_path = os.path.join(st.session_state.params.output_dir, fig_name)

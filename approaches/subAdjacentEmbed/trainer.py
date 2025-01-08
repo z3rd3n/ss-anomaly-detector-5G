@@ -178,7 +178,7 @@ def detect_anomalies(params, model, val_loader):
     fig, ax = plt.subplots()
     ax.plot(train_energy, label="scores")
     ax.axhline(threshold, color='red', label=f"Threshold (p={params.p}, q={params.q})")
-    fig_path = os.path.join(params.output_dir, f"anomalies_p{params.p}q{str(params.q)[-2:]}_val{params.validation_ratio*100}.png")
+    fig_path = os.path.join(params.output_dir, f"anomalies_p{params.p}q{str(params.q)[-2:]}.png")
     fig.savefig(fig_path)
     plt.close(fig)
     return anomalies_df, fig_path
