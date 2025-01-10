@@ -69,11 +69,12 @@ def main(params, train_func, detect_func):
         )
     if params.detect:
         logging.info("Starting detection...")
-        a, b = detect_func(
+        anomalies_df, fig_path = detect_func(
             params, 
             model, 
             val_loader, 
         )
+        anomalies_df.to_csv(f"{params.output_dir}_p{params.p}q{str(params.q)[-2:]}.csv", index=False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the main script with specified approach.")

@@ -4,7 +4,7 @@ from tqdm import tqdm
 import logging
 
 def train_one_epoch(model, dataloader, optimizer, device, 
-                    criterion_mse, span, one_side,lamda_rec=2, lambda_sacon=10, max_grad_norm=1.0):
+                    criterion, feature_config, span, one_side,lamda_rec=2, lambda_sacon=10, max_grad_norm=1.0):
     """
     Changes:
       - total_loss = rec_loss - lambda_sacon * sacon_loss
@@ -21,7 +21,7 @@ def train_one_epoch(model, dataloader, optimizer, device,
         enc_out, queries_list, keys_list = model(features)
 
         # Reconstruction loss
-        rec_loss = criterion_mse(enc_out, features) # shape [B, seq_len, D]
+        rec_loss = criterion(enc_out, features, feature_config)
 
         sacon_all_layers = 0.0
         for (q, k_) in zip(queries_list, keys_list): # e_layers times
@@ -55,7 +55,7 @@ def train_one_epoch(model, dataloader, optimizer, device,
     return avg_loss
 
 
-def validate_one_epoch(model, dataloader, device, criterion_mse, span, one_side,lamda_rec=2, lambda_sacon=10.0):
+def validate_one_epoch(model, dataloader, device, criterion, feature_config, span, one_side,lamda_rec=2, lambda_sacon=10.0):
     """
     Validation with the same objective. We return just the rec_loss or total_loss
     for logging.
@@ -72,7 +72,7 @@ def validate_one_epoch(model, dataloader, device, criterion_mse, span, one_side,
             enc_out, queries_list, keys_list = model(features)
 
             # reconstruction loss
-            rec_loss = criterion_mse(enc_out, features).mean()
+            rec_loss = criterion(enc_out, features, feature_config)
 
             # SACon
             sacon_all_layers = 0.0

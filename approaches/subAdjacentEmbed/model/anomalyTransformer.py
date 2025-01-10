@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from approaches.subAdjacent.model.attentionsLayer import LinearAnomalyAttention, AttentionLayer
-from approaches.subAdjacent.model.dataEmbedding import DataEmbedding
+from approaches.subAdjacentEmbed.model.attentionsLayer import LinearAnomalyAttention, AttentionLayer
+from approaches.subAdjacentEmbed.model.dataEmbedding import EnhancedDataEmbedding 
 
 
 class EncoderLayer(nn.Module):
@@ -48,6 +48,25 @@ class Encoder(nn.Module):
             x = self.norm(x)
 
         return x, queries_list, keys_list
+    
+class CategoricalDecoder(nn.Module):
+    def __init__(self, feature_config, d_model):
+        super(CategoricalDecoder, self).__init__()
+        self.feature_config = feature_config
+        
+        # Create separate projection heads for each feature
+        self.feature_heads = nn.ModuleDict()
+        for feat_name, config in feature_config.items():
+            n_categories = len(config["value_to_index"])
+            self.feature_heads[feat_name] = nn.Linear(d_model, n_categories)
+            
+    def forward(self, x):
+        # Dictionary to store predictions for each feature
+        predictions = {}
+        for feat_name, head in self.feature_heads.items():
+            logits = head(x)
+            predictions[feat_name] = F.softmax(logits, dim=-1)
+        return predictions
 
 
 class AnomalyTransformer(nn.Module):
@@ -57,7 +76,7 @@ class AnomalyTransformer(nn.Module):
         self.output_attention = output_attention
 
         # Encoding
-        self.embedding = DataEmbedding(enc_in, d_model, dropout)
+        self.embedding = EnhancedDataEmbedding(enc_in, d_model, dropout)
 
         attention_layers = [
             EncoderLayer(
