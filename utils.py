@@ -309,4 +309,11 @@ def bring_approach(args):
         train_func = train_model
         detect_func = detect_anomalies
         config = Config()
+
+    elif args.approach == 'subAdjacentEmbed':
+        from approaches.subAdjacentEmbed.trainer import train_model, detect_and_categorical_anomalies
+        from approaches.subAdjacentEmbed.configClass import Config
+        train_func = train_model
+        detect_func = detect_and_categorical_anomalies
+        config = Config()
     return config, train_func, detect_func

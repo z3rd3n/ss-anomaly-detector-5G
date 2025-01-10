@@ -13,8 +13,6 @@ from utils import *
 from tqdm import tqdm
 import torch.nn.functional as F
 
-with open('/workspaces/thesis/approaches/subAdjacentEmbed/model/feature_mappings.json', 'r') as file:
-        feature_config = json.load(file)
 
 def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
     start_epoch = 0
@@ -47,7 +45,7 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
             optimizer,
             params.device,
             criterion,
-            feature_config,
+            params.feature_config,
             params.span,
             params.one_side,
             lamda_rec=params.lamda_rec,
@@ -59,7 +57,7 @@ def train_model(params, model, optimizer, scheduler, train_loader, val_loader):
             val_loader,
             params.device,
             criterion,
-            feature_config,
+            params.feature_config,
             params.span,
             params.one_side,
             lamda_rec=params.lamda_rec,
@@ -201,7 +199,7 @@ def detect_and_categorical_anomalies(params, model, val_loader):
     all_originals = {feat: [] for feat in params.feature_config.keys()}
     all_timestamps = []
     
-    decoder = CategoricalDecoder(params.feature_config, params.d_model).to(params.device)
+    decoder = CategoricalDecoder(params.feature_config, params.model_dim).to(params.device)
     softmax = torch.nn.Softmax(dim=-1)
     
     with torch.no_grad():

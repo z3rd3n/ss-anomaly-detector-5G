@@ -1,5 +1,6 @@
 # subAdjacent/configClass.py
 import os
+import json
 
 class Config:
     def __init__(self):
@@ -9,7 +10,7 @@ class Config:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        self.train = False
+        self.train = True
         self.detect = True
         self.seq_len = 25
         self.stride = None
@@ -24,12 +25,14 @@ class Config:
         self.feature_columns = [
             'SFN', 'Slot', 'CC', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI',
         ]
+        with open('/workspaces/thesis/approaches/subAdjacentEmbed/model/feature_mappings.json', 'r') as file:
+            self.feature_config = json.load(file)
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.checkpoint_path = None  # Path to load checkpoint from
 
         # Directories
-        self.parquet_path = "data/scaled_pdsch.parquet"
+        self.parquet_path = "/workspaces/thesis/approaches/subAdjacentEmbed/data/unscaled_pdsch.parquet"
         script_dir = os.path.dirname(__file__)
         results_dir = os.path.join(script_dir, 'results')
         os.makedirs(results_dir, exist_ok=True)
@@ -61,9 +64,9 @@ class Config:
         self.pin_memory = True
 
     def build_model(self):
-        from approaches.subAdjacent.model.anomalyTransformer import AnomalyTransformer
+        from approaches.subAdjacentEmbed.model.anomalyTransformer import AnomalyTransformer
         model = AnomalyTransformer(
-            enc_in=len(self.feature_columns),
+            feature_config=self.feature_config,
             c_out=len(self.feature_columns),
             d_model=self.model_dim,
             n_heads=self.n_heads,

@@ -70,13 +70,13 @@ class CategoricalDecoder(nn.Module):
 
 
 class AnomalyTransformer(nn.Module):
-    def __init__(self, enc_in, c_out, d_model=512, n_heads=8, e_layers=3,
+    def __init__(self, feature_config, c_out, d_model=512, n_heads=8, e_layers=3,
                  dropout=0.0, activation='gelu', output_attention=True, negative_qk=False):
         super(AnomalyTransformer, self).__init__()
         self.output_attention = output_attention
 
         # Encoding
-        self.embedding = EnhancedDataEmbedding(enc_in, d_model, dropout)
+        self.embedding = EnhancedDataEmbedding(feature_config, d_model, dropout)
 
         attention_layers = [
             EncoderLayer(

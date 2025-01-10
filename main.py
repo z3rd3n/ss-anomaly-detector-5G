@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # main.py
 from utils import start_logging, bring_approach, count_trainable_parameters
+from approaches.subAdjacentEmbed.data.dataLoader import CategoricalParquetSequenceDataset, custom_collate_fn
 from data.dataLoader import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
 from torch import optim
@@ -15,13 +16,23 @@ def main(params, train_func, detect_func):
     logging.info(f'Number of trainable parameters: {trainable_params/1000:.1f}K')
 
     logging.info("Creating train and validation datasets...")
-    train_dataset, val_dataset = ParquetSequenceDataset.create_train_val_splits(
-        parquet_path=params.parquet_path,
-        feature_columns=params.feature_columns,
-        seq_len=params.seq_len,
-        validation_ratio=params.validation_ratio,
-        seed=params.seed
-    )
+    if params.embed:
+        train_dataset, val_dataset = CategoricalParquetSequenceDataset.create_train_val_splits(
+            parquet_path=params.parquet_path,
+            feature_config=params.feature_config,
+            seq_len=params.seq_len,
+            stride=params.stride,
+            validation_ratio=params.validation_ratio,
+            seed=params.seed
+        )
+    else:
+        train_dataset, val_dataset = ParquetSequenceDataset.create_train_val_splits(
+            parquet_path=params.parquet_path,
+            feature_columns=params.feature_columns,
+            seq_len=params.seq_len,
+            validation_ratio=params.validation_ratio,
+            seed=params.seed
+        )
 
     logging.info("Creating data loaders...")
     train_loader = DataLoader(
@@ -78,9 +89,12 @@ def main(params, train_func, detect_func):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the main script with specified approach.")
-    parser.add_argument('--approach', type=str, default='subAdjacent', help='Specify the approach to use.')
+    parser.add_argument('--approach', type=str, default='subAdjacentEmbed', help='Specify the approach to use.')
     args = parser.parse_args()
+        
 
     config, train_func, detect_func = bring_approach(args)
+    if args.approach == 'subAdjacentEmbed':
+        config.embed = True
     start_logging(config, args.approach)
     main(config, train_func, detect_func)
