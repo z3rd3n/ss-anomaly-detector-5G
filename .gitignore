@@ -1,7 +1,7 @@
 .tez
 data/scaled_pdsch.parquet
 data/scaled_pdsch_data/
-*data/
+*.parquet
 __pycache__/
 *reportable/
 *mlruns/
