@@ -1,10 +1,9 @@
-# subAdjacent/model/anomalyTransformer.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from approaches.subAdjacentEmbed.model.attentionsLayer import LinearAnomalyAttention, AttentionLayer
-from approaches.subAdjacentEmbed.model.dataEmbedding import EnhancedDataEmbedding 
+from approaches.subAdjacentEmbed.model.dataEmbedding import EnhancedDataEmbedding
 
 
 class EncoderLayer(nn.Module):
@@ -20,6 +19,7 @@ class EncoderLayer(nn.Module):
         self.activation = F.relu if activation == "relu" else F.gelu
 
     def forward(self, x):
+        # x: [B, L, D]
         new_x, queries, keys = self.attention_layer(x, x, x)
         x = x + self.dropout(new_x)
         y = x = self.norm1(x)
@@ -48,71 +48,97 @@ class Encoder(nn.Module):
             x = self.norm(x)
 
         return x, queries_list, keys_list
-    
+
+
 class CategoricalDecoder(nn.Module):
+    """
+    Projects each token embedding (dimension 'd_model') 
+    to a distribution over the possible categories for each feature.
+    """
     def __init__(self, feature_config, d_model):
         super(CategoricalDecoder, self).__init__()
         self.feature_config = feature_config
-        
-        # Create separate projection heads for each feature
         self.feature_heads = nn.ModuleDict()
         for feat_name, config in feature_config.items():
             n_categories = len(config["value_to_index"])
             self.feature_heads[feat_name] = nn.Linear(d_model, n_categories)
-            
+
     def forward(self, x):
-        # Dictionary to store predictions for each feature
+        """
+        x: [B, L, D_model]
+        Return dict: { feat_name: [B, L, n_categories] }, after softmax
+        """
         predictions = {}
         for feat_name, head in self.feature_heads.items():
-            logits = head(x)
-            predictions[feat_name] = F.softmax(logits, dim=-1)
+            logits = head(x)  # shape [B, L, n_categories]
+            predictions[feat_name] = logits
         return predictions
 
 
 class AnomalyTransformer(nn.Module):
     def __init__(self, feature_config, c_out, d_model=512, n_heads=8, e_layers=3,
                  dropout=0.0, activation='gelu', output_attention=True, negative_qk=False):
+        """
+        c_out is unused here if we're returning a dictionary (unless you need it for something else).
+        """
         super(AnomalyTransformer, self).__init__()
         self.output_attention = output_attention
 
-        # Encoding
+        # 1) Data embedding
         self.embedding = EnhancedDataEmbedding(feature_config, d_model, dropout)
 
+        # 2) Attention layers
         attention_layers = [
             EncoderLayer(
-            AttentionLayer(
-                LinearAnomalyAttention(
-                dropout=dropout, 
-                output_attention=output_attention, 
-                negative_qk=negative_qk
+                AttentionLayer(
+                    LinearAnomalyAttention(
+                        dropout=dropout,
+                        output_attention=output_attention,
+                        negative_qk=negative_qk
+                    ),
+                    d_model,
+                    n_heads
                 ),
-                d_model, 
-                n_heads
-            ),
-            d_model,
-            dropout=dropout,
-            activation=activation
-            ) 
+                d_model,
+                dropout=dropout,
+                activation=activation
+            )
             for _ in range(e_layers)
         ]
-        
         self.encoder = Encoder(
             attn_layers=attention_layers,
             norm_layer=torch.nn.LayerNorm(d_model)
         )
 
-        self.projection = nn.Linear(d_model, c_out, bias=True)
+        # 3) Categorical Decoder
+        self.decoder = CategoricalDecoder(feature_config, d_model)
+        
+        # If you no longer need a single projection, you can remove it:
+        # self.projection = nn.Linear(d_model, c_out, bias=True)
 
     def forward(self, x):
-        enc_out = self.embedding(x)
-        enc_out, queries_list, keys_list = self.encoder(enc_out)
-        enc_out = self.projection(enc_out)
+        """
+        x is expected to be a dict of LongTensors (per-feature), 
+        shape [B, L] each, as handled by EnhancedDataEmbedding.
+        
+        Returns:
+          - predictions: dict of {feat_name: [B, L, n_classes_for_that_feat]}
+          - queries_list, keys_list: attention for each layer if output_attention=True
+        """
+        # 1) Embed
+        enc_out = self.embedding(x)  # [B, L, d_model]
+
+        # 2) Encoder
+        enc_out, queries_list, keys_list = self.encoder(enc_out)  # [B, L, d_model]
+
+        # 3) Decode to a dictionary of feature distributions
+        preds = self.decoder(enc_out)  # { feat_name: [B, L, n_categories] }
 
         if self.output_attention:
-            return enc_out, queries_list, keys_list
+            return preds, queries_list, keys_list
         else:
-            return enc_out  # [B, L, D]
-        
+            return preds
+
     def compute_sub_adj_contrib(self, q, k, span, one_side):
         """
         Same as your SACon function, returning shape [B, L].
@@ -121,28 +147,24 @@ class AnomalyTransformer(nn.Module):
         L = q.shape[1]
         assert L >= span[1] >= span[0] >= 0
 
-        # compute attention matrix
+        # compute attention matrix: shape [B, n_heads, L, L]
         attnMatrix = torch.einsum("b l h e, b s h e -> b h l s", q, k)
-        den = attnMatrix.sum(dim=-1, keepdim=True)
-        den = den.clamp(min=1e-6)
+        den = attnMatrix.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         attnMatrix = attnMatrix / den
 
-
         lossMat = None
-        for k in range(-span[1], span[1] + 1):  # range(-span[1], -span[0]+1)
-            # only one-side is used
-            if one_side:
-                if k < span[0]:
-                    continue
-            else:
-                if abs(k) < span[0]:
-                    continue
+        for offset in range(-span[1], span[1] + 1):
+            # handle one-side skip
+            if one_side and offset < span[0]:
+                continue
+            if not one_side and abs(offset) < span[0]:
+                continue
 
-            diag1 = torch.diagonal(attnMatrix, offset=k, dim1=-2, dim2=-1)
-            if k > 0:
-                p1d = (k, 0)
+            diag1 = torch.diagonal(attnMatrix, offset=offset, dim1=-2, dim2=-1)
+            if offset > 0:
+                p1d = (offset, 0)
             else:
-                p1d = (0, abs(k))
+                p1d = (0, abs(offset))
             diag1 = F.pad(diag1, p1d)
 
             if lossMat is None:
@@ -150,11 +172,12 @@ class AnomalyTransformer(nn.Module):
             else:
                 lossMat += diag1
 
-            if k > 0:
-                offset_k = -(L-k)
+            # second diagonal pass
+            if offset > 0:
+                offset_k = -(L - offset)
             else:
-                offset_k = L+k
-            diag1 = torch.diagonal(attnMatrix, offset=offset_k, dim1=-2, dim2=-1)  # why use L-k ?  L-k performs better
+                offset_k = L + offset
+            diag1 = torch.diagonal(attnMatrix, offset=offset_k, dim1=-2, dim2=-1)
             if offset_k > 0:
                 p1d = (offset_k, 0)
             else:
@@ -163,7 +186,6 @@ class AnomalyTransformer(nn.Module):
 
             lossMat += diag1
 
-        # b,h,l
+        # shape is [B, n_heads, L]; average over n_heads => [B, L]
         lossMat = torch.mean(lossMat, dim=-2)
-
-        return lossMat  # B,L
+        return lossMat

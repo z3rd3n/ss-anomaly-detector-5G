@@ -9,7 +9,6 @@ if BASE_DIR not in sys.path:
 from subAdjacent.run_epoch import train_one_epoch, validate_one_epoch
 from utils import *
 from tqdm import tqdm
-import ptvsd
 
 
 def train_model(params, model, optimizer, scheduler, train_loader, val_loader):

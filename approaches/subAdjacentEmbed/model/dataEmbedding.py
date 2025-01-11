@@ -153,14 +153,14 @@ def compute_categorical_reconstruction_loss(predictions, targets, feature_config
     """
     total_loss = 0
     for feat_name in feature_config:
-        pred = predictions[..., feature_config[feat_name]["feature_idx"]]
-        true = targets[..., feature_config[feat_name]["feature_idx"]]
+        pred = predictions[feat_name]
+        true = targets[feat_name]
         
         # Get class weights for this feature
         weights = torch.tensor([
             feature_config[feat_name]["class_weights"].get(str(i), 1.0)
             for i in range(len(feature_config[feat_name]["value_to_index"]))
-        ]).to(predictions.device)
+        ])
         
         # Compute weighted cross entropy for this feature
         loss = F.cross_entropy(
@@ -170,6 +170,6 @@ def compute_categorical_reconstruction_loss(predictions, targets, feature_config
             reduction='none'
         )
         
-        total_loss += loss.reshape(predictions.shape[0], -1)
+        total_loss += loss
     
     return total_loss

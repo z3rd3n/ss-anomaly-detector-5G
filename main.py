@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # main.py
 from utils import start_logging, bring_approach, count_trainable_parameters
-from approaches.subAdjacentEmbed.data.dataLoader import CategoricalParquetSequenceDataset, custom_collate_fn
+from approaches.subAdjacentEmbed.data.dataLoader import CategoricalParquetSequenceDataset, custom_collate_fn_categorical
 from data.dataLoader import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
 from torch import optim
@@ -39,7 +39,7 @@ def main(params, train_func, detect_func):
         train_dataset,
         batch_size=params.batch_size,
         num_workers=params.num_workers,
-        collate_fn=custom_collate_fn,
+        collate_fn=custom_collate_fn_categorical,
         pin_memory=params.pin_memory,
         drop_last=True
     )
@@ -48,7 +48,7 @@ def main(params, train_func, detect_func):
         val_dataset,
         batch_size=params.batch_size,
         num_workers=params.num_workers,
-        collate_fn=custom_collate_fn,
+        collate_fn=custom_collate_fn_categorical,
         pin_memory=params.pin_memory,
         drop_last=True
     )

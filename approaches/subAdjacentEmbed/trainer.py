@@ -192,144 +192,178 @@ def detect_anomalies(params, model, val_loader):
 def detect_and_categorical_anomalies(params, model, val_loader):
     """
     Enhanced anomaly detection and reporting for categorical features
+    where the model returns a dictionary of per-feature predictions.
     """
     model.eval()
     all_scores = []
     all_predictions = {feat: [] for feat in params.feature_config.keys()}
     all_originals = {feat: [] for feat in params.feature_config.keys()}
     all_timestamps = []
-    
-    decoder = CategoricalDecoder(params.feature_config, params.model_dim).to(params.device)
+
     softmax = torch.nn.Softmax(dim=-1)
-    
+
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Detecting anomalies"):
-            features = batch['features'].to(params.device)
-            timestamps = batch['timestamps']
+            # Move each feature in 'batch' to device
+            device_features = {
+                feat_name: batch['features'][feat_name].to(params.device)
+                for feat_name in batch['features']
+            }
+            timestamps = batch['timestamps']  # list of lists of length [batch_size]
+
+            # 1) Forward pass: model returns a dictionary of predictions + attention
+            #    For example: preds_dict, queries_list, keys_list = model(device_features)
+            preds_dict, queries_list, keys_list = model(device_features)
+            # preds_dict[feat_name] -> shape [B, L, n_categories]
             
-            # Get model outputs
-            enc_out, queries_list, keys_list = model(features)
-            
-            # Decode predictions back to categorical probabilities
-            decoded_preds = decoder(enc_out)
-            
-            # Calculate reconstruction loss per feature
-            rec_loss = 0
-            for feat_name, pred_probs in decoded_preds.items():
-                true_indices = features[..., params.feature_config[feat_name]["feature_idx"]].long()
+            batch_size = list(preds_dict.values())[0].shape[0]
+            seq_len = list(preds_dict.values())[0].shape[1]
+
+            # 2) Compute reconstruction loss (cross-entropy per feature)
+            #    We'll accumulate shape [B, L] for each feature
+            rec_loss = torch.zeros((batch_size, seq_len), device=params.device)
+
+            for feat_name, pred_probs in preds_dict.items():
+                # pred_probs: [B, L, n_categories] (already softmaxed or logits)
+                true_indices = device_features[feat_name]  # [B, L]
+                
+                # Build class weights for this feature
+                weights = torch.tensor([
+                    params.feature_config[feat_name]["class_weights"].get(str(i), 1.0)
+                    for i in range(len(params.feature_config[feat_name]["value_to_index"]))
+                ], device=params.device)
+
+                # Flatten for cross entropy
                 feat_loss = F.cross_entropy(
-                    pred_probs.reshape(-1, pred_probs.size(-1)),
-                    true_indices.reshape(-1),
-                    weight=torch.tensor([
-                        params.feature_config[feat_name]["class_weights"].get(str(i), 1.0)
-                        for i in range(len(params.feature_config[feat_name]["value_to_index"]))
-                    ]).to(params.device),
+                    pred_probs.reshape(-1, pred_probs.size(-1)),  # [B*L, n_categories]
+                    true_indices.reshape(-1),                     # [B*L]
+                    weight=weights,
                     reduction='none'
-                ).reshape(features.shape[0], -1)
+                ).reshape(batch_size, seq_len)
+
                 rec_loss += feat_loss
-            
-            # Calculate attention-based anomaly contribution
+
+            # 3) Compute attention-based anomaly contribution
+            #    (SACon) from queries_list, keys_list
             loss_attn = 0.0
-            for q, k in zip(queries_list, keys_list):
-                loss_attn += model.compute_sub_adj_contrib(q, k, params.span, params.one_side)
-            loss_attn /= len(queries_list)
-            
-            # Compute final anomaly scores
+            for q, k_ in zip(queries_list, keys_list):
+                # compute_sub_adj_contrib => [B, L]
+                loss_attn += model.compute_sub_adj_contrib(q, k_, params.span, params.one_side)
+            loss_attn /= len(queries_list)  # shape [B, L]
+
+            # 4) Final anomaly scores = softmax(-loss_attn) * rec_loss, shape [B, L]
             anomaly_scores = softmax(-loss_attn) * rec_loss
-            all_scores.append(anomaly_scores.cpu().numpy())
-            
-            # Store predictions and original values
-            for feat_name, pred_probs in decoded_preds.items():
-                # Get most likely class
-                pred_classes = pred_probs.argmax(dim=-1)
-                true_classes = features[..., params.feature_config[feat_name]["feature_idx"]].long()
-                
-                # Convert indices back to original values
+            anomaly_scores_flat = anomaly_scores.reshape(-1)  # [B*L]
+            all_scores.append(anomaly_scores_flat.cpu().numpy())
+
+            # 5) Store predictions & originals
+            #    Flatten each [B, L] or [B, L, n_cat] to append globally
+            for feat_name, pred_probs in preds_dict.items():
+                # pred_probs -> [B, L, n_categories]
+                pred_classes = pred_probs.argmax(dim=-1)  # [B, L]
+                true_classes = device_features[feat_name] # [B, L]
+
                 idx_to_value = params.feature_config[feat_name]["index_to_value"]
-                pred_values = torch.tensor([float(idx_to_value[str(idx.item())]) for idx in pred_classes.flatten()])
-                true_values = torch.tensor([float(idx_to_value[str(idx.item())]) for idx in true_classes.flatten()])
-                
-                all_predictions[feat_name].append(pred_values.numpy())
-                all_originals[feat_name].append(true_values.numpy())
-            
-            all_timestamps.extend([t for sublist in timestamps for t in sublist])
-    
-    # Concatenate all scores and values
-    all_scores = np.concatenate(all_scores, axis=0).reshape(-1)
+
+                # Flatten
+                pred_classes_flat = pred_classes.view(-1)
+                true_classes_flat = true_classes.view(-1)
+
+                # Convert indices -> original values
+                pred_values = [
+                    float(idx_to_value[str(idx.item())]) for idx in pred_classes_flat
+                ]
+                true_values = [
+                    float(idx_to_value[str(idx.item())]) for idx in true_classes_flat
+                ]
+
+                all_predictions[feat_name].append(np.array(pred_values))
+                all_originals[feat_name].append(np.array(true_values))
+
+            # 6) Flatten timestamps as well
+            #    timestamps is [batch_size, seq_len], each sublist => length = seq_len
+            #    We'll just combine them in row-major order
+            flat_timestamps = [ts for sublist in timestamps for ts in sublist]
+            all_timestamps.extend(flat_timestamps)
+
+    # end of with torch.no_grad() loop
+
+    # 7) Concatenate everything
+    all_scores = np.concatenate(all_scores, axis=0)  # shape [total_windows * seq_len]
     for feat_name in all_predictions:
-        all_predictions[feat_name] = np.concatenate(all_predictions[feat_name])
+        all_predictions[feat_name] = np.concatenate(all_predictions[feat_name])  # shape [total_windows * seq_len]
         all_originals[feat_name] = np.concatenate(all_originals[feat_name])
-    
-    # Calculate threshold using EVT
+
+    # 8) Calculate threshold using EVT
     threshold = calculate_threshold_evt(all_scores, params.q, params.p)
     print(f"Threshold derived from q={params.q}, p={params.p} => {threshold:.4f}")
-    
-    # Find anomalous points
+
+    # 9) Identify anomalies
     anomaly_indices = np.where(all_scores >= threshold)[0]
     logging.info(f"Total anomaly count: {len(anomaly_indices)} from {len(all_scores)} "
-                f"ratio {len(anomaly_indices)/len(all_scores)} (threshold={threshold})")
-    
-    if len(anomaly_indices) > 0:
-        # Create anomaly report DataFrame
-        anomaly_data = {
-            'timestamp_str': [all_timestamps[i] for i in anomaly_indices],
-            'threshold': threshold,
-            'anomaly_score': all_scores[anomaly_indices],
-            'distance_from_threshold': (all_scores[anomaly_indices] - threshold)
-        }
-        
-        # Add original and predicted values for each feature
-        for feat_name in params.feature_config:
-            anomaly_data[feat_name] = all_originals[feat_name][anomaly_indices]
-            anomaly_data[f"{feat_name}_p"] = all_predictions[feat_name][anomaly_indices]
-            
-            # Add confidence scores for predictions
-            if f"{feat_name}_conf" not in anomaly_data:
-                anomaly_data[f"{feat_name}_conf"] = np.max(
-                    F.softmax(torch.tensor(all_predictions[feat_name][anomaly_indices]), dim=-1).numpy(),
-                    axis=-1
-                )
-        
-        anomalies_df = pd.DataFrame(anomaly_data)
-        
-        # Sort by anomaly score in descending order
-        anomalies_df = anomalies_df.sort_values('anomaly_score', ascending=False)
-        
-        # Save results
-        output_path = os.path.join(
-            params.output_dir, 
-            f"anomalies_p{params.p}q{str(params.q)[-2:]}_val{params.validation_ratio*100}.csv"
-        )
-        anomalies_df.to_csv(output_path, index=False)
-        
-        # Create visualization
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
-        
-        # Plot anomaly scores
-        ax1.plot(all_scores, label="Anomaly Scores")
-        ax1.axhline(threshold, color='red', linestyle='--', label=f"Threshold (p={params.p}, q={params.q})")
-        ax1.set_title("Anomaly Scores Over Time")
-        ax1.legend()
-        
-        # Plot feature-wise anomaly distribution
-        feature_anomaly_counts = {
-            feat: np.sum(np.abs(all_originals[feat][anomaly_indices] - 
-                               all_predictions[feat][anomaly_indices]) > 0)
-            for feat in params.feature_config
-        }
-        ax2.bar(feature_anomaly_counts.keys(), feature_anomaly_counts.values())
-        ax2.set_title("Anomaly Distribution Across Features")
-        ax2.set_xticklabels(feature_anomaly_counts.keys(), rotation=45)
-        
-        plt.tight_layout()
-        fig_path = os.path.join(
-            params.output_dir,
-            f"anomalies_p{params.p}q{str(params.q)[-2:]}_val{params.validation_ratio*100}.png"
-        )
-        fig.savefig(fig_path)
-        plt.close(fig)
-        
-        return anomalies_df, fig_path
-    else:
+                 f"ratio {len(anomaly_indices)/len(all_scores)} (threshold={threshold})")
+
+    if len(anomaly_indices) == 0:
         logging.warning("No anomalies found.")
         return pd.DataFrame(), None
+
+    # 10) Create anomaly report
+    anomaly_data = {
+        'timestamp_str': [all_timestamps[i] for i in anomaly_indices],
+        'threshold': threshold,
+        'anomaly_score': all_scores[anomaly_indices],
+        'distance_from_threshold': (all_scores[anomaly_indices] - threshold)
+    }
+
+    # Add original and predicted values for each feature
+    for feat_name in params.feature_config:
+        anomaly_data[feat_name] = all_originals[feat_name][anomaly_indices]
+        anomaly_data[f"{feat_name}_p"] = all_predictions[feat_name][anomaly_indices]
+
+        # Optional "confidence" measure if you want:
+        # Currently you have a single predicted class, not the full distribution at this point.
+        # If you'd like confidence from the distribution, you'd store the maximum predicted-prob
+        # from preds_dict before flattening. That would require storing those as well.
+
+    anomalies_df = pd.DataFrame(anomaly_data)
+    # Sort by anomaly score
+    anomalies_df = anomalies_df.sort_values('anomaly_score', ascending=False)
+
+    # 11) Save results
+    output_path = os.path.join(
+        params.output_dir,
+        f"anomalies_p{params.p}q{str(params.q)[-2:]}_val{int(params.validation_ratio*100)}.csv"
+    )
+    anomalies_df.to_csv(output_path, index=False)
+
+    # 12) Visualization
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+
+    # Plot anomaly scores
+    ax1.plot(all_scores, label="Anomaly Scores")
+    ax1.axhline(threshold, color='red', linestyle='--',
+                label=f"Threshold (p={params.p}, q={params.q})")
+    ax1.set_title("Anomaly Scores Over Time")
+    ax1.legend()
+
+    # Plot feature-wise anomaly distribution
+    feature_anomaly_counts = {
+        feat: np.sum(
+            np.abs(all_originals[feat][anomaly_indices] -
+                   all_predictions[feat][anomaly_indices]) != 0
+        )
+        for feat in params.feature_config
+    }
+    ax2.bar(feature_anomaly_counts.keys(), feature_anomaly_counts.values())
+    ax2.set_title("Anomaly Distribution Across Features")
+    ax2.set_xticklabels(feature_anomaly_counts.keys(), rotation=45)
+
+    plt.tight_layout()
+    fig_path = os.path.join(
+        params.output_dir,
+        f"anomalies_p{params.p}q{str(params.q)[-2:]}_val{int(params.validation_ratio*100)}.png"
+    )
+    fig.savefig(fig_path)
+    plt.close(fig)
+
+    return anomalies_df, fig_path

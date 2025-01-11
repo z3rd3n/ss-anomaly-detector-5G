@@ -16,7 +16,10 @@ def train_one_epoch(model, dataloader, optimizer, device,
 
     train_pbar = tqdm(dataloader, desc="Training", total=len(dataloader))
     for batch_idx, batch in enumerate(train_pbar):
-        features = batch['features'].to(device)  # [B, seq_len, D]
+        features = {
+            feat_name: feat_tensor.to(device) 
+            for feat_name, feat_tensor in batch['features'].items()
+        }
 
         enc_out, queries_list, keys_list = model(features)
 
