@@ -199,30 +199,15 @@ class ParquetSequenceDataset(IterableDataset):
 
 
 def custom_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Custom collate function to stack all features into a single tensor"""
+    """Custom collate function to handle both tensor and string data."""
     try:
-        # Get all feature names
-        feature_names = list(batch[0]['features'].keys())
-        batch_size = len(batch)
-        seq_len = batch[0]['features'][feature_names[0]].shape[0]
-        num_features = len(feature_names)
-        
-        # Create a tensor to hold all features
-        # Shape will be [batch_size, seq_len, num_features]
-        stacked_features = torch.zeros((batch_size, seq_len, num_features), dtype=torch.long)
-        
-        # Fill the tensor with features
-        for b_idx, item in enumerate(batch):
-            for f_idx, feat_name in enumerate(feature_names):
-                stacked_features[b_idx, :, f_idx] = item['features'][feat_name]
-        
+        features = torch.stack([item['features'] for item in batch])
         timestamps = [item['timestamps'] for item in batch]
         
         return {
-            'features': stacked_features,  # Shape: [batch_size, seq_len, num_features]
+            'features': features,
             'timestamps': timestamps,
         }
     except Exception as e:
         logging.error(f"Error in collate_fn: {e}")
-        raise e  # Re-raise the exception to see the full traceback(f"Error in collate_fn: {e}")
         return {}
