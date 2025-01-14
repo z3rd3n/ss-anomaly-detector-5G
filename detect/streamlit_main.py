@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 import sys
 import json
-from mlflow.tracking import MlflowClient
 
 # --- Ensure the session_state variables exist before using them ---
 if "detect_path" not in st.session_state:

@@ -39,7 +39,7 @@ def main(params, train_func, detect_func):
         train_dataset,
         batch_size=params.batch_size,
         num_workers=params.num_workers,
-        collate_fn=custom_collate_fn_categorical,
+        collate_fn=custom_collate_fn,
         pin_memory=params.pin_memory,
         drop_last=True
     )
@@ -48,7 +48,7 @@ def main(params, train_func, detect_func):
         val_dataset,
         batch_size=params.batch_size,
         num_workers=params.num_workers,
-        collate_fn=custom_collate_fn_categorical,
+        collate_fn=custom_collate_fn,
         pin_memory=params.pin_memory,
         drop_last=True
     )
