@@ -162,7 +162,7 @@ def detect_anomalies(params, model, val_loader):
         # Sort by anomaly score in descending order
         anomalies_df = anomalies.sort_values('anomaly_score', ascending=False)
         logging.info("Anomalies detected.")
-        #anomalies_df.to_csv(f"{params.output_dir}_p{params.p}q{str(params.q)[-2:]}.csv", index=False)
+        #anomalies_df.to_csv(f"{params.output_dir}_p{params.p}q{str(params.q)[2:]}.csv", index=False)
 
     if anomalies_df.empty:
         logging.warning("No anomalies found (empty DataFrame).")
@@ -181,3 +181,91 @@ def detect_anomalies(params, model, val_loader):
     fig.savefig(fig_path)
     plt.close(fig)
     return anomalies_df, fig_path
+
+def detect_anomalies_from_threshold(params, model, val_loader, threshold=0.05):
+
+    model.eval()
+    criterion_mse = torch.nn.MSELoss(reduction='none')
+    softmax = torch.nn.Softmax(dim=-1)
+
+    # Prepare an empty anomalies DataFrame up front
+    anomalies_df = pd.DataFrame(
+        columns=[
+            'timestamp_str', 'SFN', 'SFN_p', 'Slot', 'Slot_p', 'CC', 'CC_p', 
+            'HARQ', 'HARQ_p', 'MCS', 'MCS_p', 'CRC', 'CRC_p', 'ReTx', 
+            'ReTx_p', 'NDI', 'NDI_p', 'threshold', 'anomaly_score', 
+            'distance_from_threshold'
+        ]
+    )
+
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(val_loader, desc="Detecting anomalies")):
+            features = batch['features'].to(params.device)
+            timestamps = batch['timestamps']
+            timestamps_flat = [item for sublist in timestamps for item in sublist]
+            # Forward pass
+            enc_out, queries_list, keys_list = model(features)
+
+            # Per-window reconstruction loss
+            rec_loss = criterion_mse(enc_out, features).mean(dim=-1)
+
+            # Calculate SACon from all layers
+            loss_attn = 0.0
+            for q, k in zip(queries_list, keys_list):
+                loss_attn += model.compute_sub_adj_contrib(q, k, params.span, params.one_side)
+            loss_attn /= len(queries_list)
+
+            # Combined score
+            train_score = softmax(-loss_attn) * rec_loss
+            train_score_cpu = train_score.cpu().numpy().reshape(-1)
+
+            # Identify indices above threshold for this batch
+            anomaly_indices = np.where(train_score_cpu >= threshold)[0]
+            if len(anomaly_indices) > 0:
+                # Extract anomalies from CPU side
+                batch_features = features.cpu().numpy().reshape(-1, features.shape[-1])
+                batch_preds = enc_out.cpu().numpy().reshape(-1, features.shape[-1])
+
+                # Unscale only the anomalies
+                unscaled = unscale_features(batch_features[anomaly_indices, :])
+                predicted = unscale_features(batch_preds[anomaly_indices, :])
+
+                # Build per-batch anomalies DataFrame
+                local_anomalies = pd.DataFrame({
+                    'timestamp_str': [timestamps_flat[row] for row in anomaly_indices],
+                    'SFN':  unscaled[:, 0].astype(int),
+                    'SFN_p': predicted[:, 0].astype(int),
+                    'Slot': unscaled[:, 1].astype(int),
+                    'Slot_p': predicted[:, 1].astype(int),
+                    'CC': unscaled[:, 2].astype(int),
+                    'CC_p': predicted[:, 2].astype(int),
+                    'HARQ': unscaled[:, 3].astype(int),
+                    'HARQ_p': predicted[:, 3].astype(int),
+                    'MCS': unscaled[:, 4].astype(int),
+                    'MCS_p': predicted[:, 4].astype(int),
+                    'CRC': unscaled[:, 5].astype(int),
+                    'CRC_p': predicted[:, 5].astype(int),
+                    'ReTx': unscaled[:, 6].astype(int),
+                    'ReTx_p': predicted[:, 6].astype(int),
+                    'NDI': unscaled[:, 7].astype(int),
+                    'NDI_p': predicted[:, 7].astype(int),
+                    'threshold': threshold,
+                    'anomaly_score': train_score_cpu[anomaly_indices],
+                    'distance_from_threshold': train_score_cpu[anomaly_indices] - threshold
+                })
+
+                # Append to global anomalies_df
+                anomalies_df = pd.concat([anomalies_df, local_anomalies], ignore_index=True)
+
+    # If no anomalies found, anomalies_df will be empty
+    if anomalies_df.empty:
+        logging.warning("No anomalies found (empty DataFrame).")
+    else:
+        # Sort final anomalies in descending order by anomaly_score
+        anomalies_df = anomalies_df.sort_values("anomaly_score", ascending=False)
+        logging.info(f"Found {len(anomalies_df)} anomalies in total.")
+
+    anomalies_df.to_csv(f"temp_mlflow/anomalies_p{params.p}q{str(params.q)[2:]}v{int(params.validation_ratio * 100)}.csv", index=False)
+
+    return anomalies_df, None
+

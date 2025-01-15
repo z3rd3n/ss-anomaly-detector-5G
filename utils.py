@@ -297,10 +297,10 @@ def calculate_threshold_evt(scores, q=0.99, p=95):
 
 def bring_approach(args):
     if args.approach == 'subAdjacent':
-        from approaches.subAdjacent.trainer import train_model, detect_anomalies
+        from approaches.subAdjacent.trainer import train_model, detect_anomalies, detect_anomalies_from_threshold
         from approaches.subAdjacent.configClass import Config
         train_func = train_model
-        detect_func = detect_anomalies
+        detect_func = detect_anomalies_from_threshold
         config = Config()
 
     elif args.approach == 'subAdjacentLSTM':

@@ -15,7 +15,7 @@ class Config:
         self.stride = None
         self.batch_size = 32
         self.num_epochs = 15
-        self.validation_ratio=0.2
+        self.validation_ratio=0.99
         self.learning_rate = 1e-4
 
         self.optimizer_name = 'AdamW'

@@ -16,7 +16,7 @@ if "detect_path" not in st.session_state:
 if "labeled_path" not in st.session_state:
     st.session_state.labeled_path = ""
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
@@ -25,27 +25,17 @@ from utils import load_checkpoint, plot_attention_matrices, unscale_features
 from approaches.subAdjacent.trainer import detect_anomalies
 from data.dataLoader import ParquetSequenceDataset, custom_collate_fn
 
+
 @st.cache_data
 def load_file_mapping(mapping_path: str = "data/file_mapping.json"):
-    """
-    Reads the file_mapping.json that maps something like {"155": 0, "160": 1, ...}.
-    Adjust the path as needed.
-    """
     with open(mapping_path, "r") as f:
         return json.load(f)
 
 @st.cache_data
 def load_parquet_for_file(numeric_id_val: int, parquet_path: str = "data/scaled_pdsch.parquet"):
-    """
-    Loads only the rows matching file_id == numeric_id_val from the Parquet file.
-    This is more efficient than reading the entire file if it is partitioned 
-    or if you use 'filters' in read_parquet.
-    Adjust the path as needed.
-    """
     if not os.path.exists(parquet_path):
         return pd.DataFrame()
 
-    # Filter to get only rows for the given numeric_id
     df = pd.read_parquet(
         parquet_path,
         filters=[("file_id", "=", numeric_id_val)]
@@ -53,10 +43,6 @@ def load_parquet_for_file(numeric_id_val: int, parquet_path: str = "data/scaled_
     return df
 
 def parse_original_id(timestamp_str: str) -> str:
-    """
-    Extracts the file portion before the semicolon, e.g. "155.csv" from "155.csv; foo"
-    Then returns just the digits ("155") from "155.csv".
-    """
     file_part = timestamp_str.split(";")[0]  # e.g. "155.csv"
     return "".join(filter(str.isdigit, file_part))  # "155"
 
@@ -65,15 +51,16 @@ def app_main():
     logging.basicConfig(level=logging.INFO)
     st.set_page_config(layout="wide", page_title="Anomaly Labeling + MLflow Demo")
 
-    # For demonstration, let's have multiple pages in Streamlit using st.tabs
     tabs = st.tabs([
         "MLflow Model Loader", 
         "Anomaly Detection & Labeling", 
         "Attention Matrices", 
         "Highest Score Anomalies"
     ])
-    
-    # ------------------- TAB 0: MLflow Model Loader ---------------------------
+
+    # -------------------------------------------------------------------------
+    # TAB 0: MLflow Model Loader
+    # -------------------------------------------------------------------------
     with tabs[0]:
         st.header("MLflow Model Loader")
         st.write("This section downloads the model from MLflow and sets up the environment.")
@@ -83,10 +70,10 @@ def app_main():
             help="Must be http(s) if using mlflow-artifacts store"
         )
         run_id = st.text_input("Enter MLflow run_id:", value="809606034f6e4682b2f327d249eff203", help="Paste the run_id from MLflow")
+        
         if st.button("Load Model & Config from MLflow"):
             if not run_id:
                 st.error("Please provide a run_id.")
-            
             else:
                 with st.spinner("Downloading and loading model..."):
                     mlflow.set_tracking_uri(tracking_uri)
@@ -101,10 +88,8 @@ def app_main():
                     # 2) Download checkpoint
                     ckpt_path = download_artifact(run_id, "checkpoints/checkpoint_best.pt", st.session_state.temp_dir)
                     mlflow.set_tracking_uri(tracking_uri)
-                    # If the run is known to be in subAdjacent, do this
                     mlflow.set_experiment("subAdjacent")
                     
-                    # Only do this once:
                     if mlflow.active_run() is None:
                         mlflow.start_run(run_id=run_id)
 
@@ -112,7 +97,10 @@ def app_main():
                     st.session_state.model = st.session_state.params.build_model()
 
                     # Build optimizer
-                    if hasattr(st.session_state.params, "optimizer") and st.session_state.params.optimizer == "AdamW":
+                    if (
+                        hasattr(st.session_state.params, "optimizer") 
+                        and st.session_state.params.optimizer == "AdamW"
+                    ):
                         st.session_state.optimizer = torch.optim.AdamW(
                             st.session_state.model.parameters(),
                             lr=st.session_state.params.learning_rate,
@@ -131,32 +119,33 @@ def app_main():
                     st.write("Current parameters:")
                     st.json({key: value for key, value in vars(st.session_state.params).items()})
 
-    # ------------------- TAB 1: Anomaly Detection & Labeling ------------------
+    # -------------------------------------------------------------------------
+    # TAB 1: Anomaly Detection & Labeling
+    # -------------------------------------------------------------------------
     with tabs[1]:
         st.header("Anomaly Detection & Labeling")
-        st.write("This section runs anomaly detection, saves results, and allows labeling anomalies grouped by file/folder.")
+        st.write("This section runs anomaly detection, saves results, and allows labeling anomalies.")
 
         if "model" not in st.session_state:
             st.warning("Please go to the 'MLflow Model Loader' tab to load a model first.")
         else:
-            # Let user specify p and q
             st.subheader("Run Anomaly Detection with custom p and q")
             p_val = st.number_input("Percentile (p)", min_value=0, max_value=100, value=95, step=1)
             q_val = st.number_input("Quartile (q)", min_value=0.0, max_value=1.0, value=0.99, step=0.01)
+            validation_ratio = st.number_input("Val Ratio", min_value=0.2, max_value=1.0, value=0.2, step=0.1)
             st.session_state.params.q = q_val
             st.session_state.params.p = p_val
-            #st.session_state.params.validation_ratio = 0.9
+            st.session_state.params.validation_ratio = validation_ratio
             
-            # Construct detect/labeled paths inside the chosen output_dir
+            # Construct detect/labeled paths
             st.session_state.detect_path = os.path.join(
                 st.session_state.params.output_dir, 
-                f"anomalies_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}v{int(st.session_state.params.validation_ratio * 100)}.csv"
+                f"anomalies_p{st.session_state.params.p}q{str(st.session_state.params.q)[2:]}v{int(st.session_state.params.validation_ratio * 100)}.csv"
             )
             st.session_state.labeled_path = os.path.join(
                 st.session_state.params.output_dir, 
-                f"labeled_p{st.session_state.params.p}q{str(st.session_state.params.q)[-2:]}v{int(st.session_state.params.validation_ratio * 100)}.csv"
+                f"labeled_p{st.session_state.params.p}q{str(st.session_state.params.q)[2:]}v{int(st.session_state.params.validation_ratio * 100)}.csv"
             )
-
 
             # Create validation dataset & loader
             _, val_dataset = ParquetSequenceDataset.create_train_val_splits(
@@ -166,7 +155,6 @@ def app_main():
                 validation_ratio=st.session_state.params.validation_ratio,
                 seed=st.session_state.params.seed
             )
-
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=st.session_state.params.batch_size,
@@ -175,137 +163,132 @@ def app_main():
                 pin_memory=st.session_state.params.pin_memory,
                 drop_last=True
             )
-
             st.session_state.val_loader = val_loader
 
+            # Run detection button
             if st.button("Run Anomaly Detection"):
                 with st.spinner("Running detection..."):
-                    # If old CSVs exist, warn & remove them
+                    # Overwrite old CSVs
                     if os.path.exists(st.session_state.detect_path):
-                        st.warning(f"Anomalies CSV {st.session_state.detect_path} already exists. Overwriting.")
+                        st.warning(f"Anomalies CSV {st.session_state.detect_path} exists. Overwriting.")
                         os.remove(st.session_state.detect_path)
 
                     if os.path.exists(st.session_state.labeled_path):
-                        st.warning(f"Labeled anomalies CSV {st.session_state.labeled_path} already exists. Overwriting.")
+                        st.warning(f"Labeled CSV {st.session_state.labeled_path} exists. Overwriting.")
                         os.remove(st.session_state.labeled_path) 
 
-                    # Actual detection
                     anomalies_df, fig_path = detect_anomalies(
                         params=st.session_state.params, 
                         model=st.session_state.model, 
                         val_loader=val_loader
                     )
 
-                    # Add user_label column
-                    anomalies_df["user_label"] = None
-
-                    # Save anomalies
                     anomalies_df.to_csv(st.session_state.detect_path, index=False)
                     st.success(f"Anomalies saved to {st.session_state.detect_path}")
-
-                    # Also log the anomalies CSV to MLflow
                     mlflow.log_artifact(st.session_state.detect_path, artifact_path="detection_results", run_id=run_id)
-
-                    # Log the anomaly scores figure if it exists
                     if fig_path and os.path.exists(fig_path):
                         mlflow.log_artifact(fig_path, artifact_path="plots", run_id=run_id)
-
-                    # Keep anomalies in session_state
                     st.session_state.detected_anomalies_df = anomalies_df
 
             st.write("---")
-            # ------  Labeling UI  ------
+            # -------------- Start of Labeling UI --------------------------------
             if not os.path.exists(st.session_state.detect_path):
-                st.warning("No anomalies CSV found. Please run anomaly detection first.")
+                st.warning("No anomalies CSV found. Please run detection first.")
             else:
                 anomalies_df = pd.read_csv(st.session_state.detect_path)
-                if "user_label" not in anomalies_df.columns:
-                    anomalies_df["user_label"] = None
+                if "anomalous_features" not in anomalies_df.columns:
+                    anomalies_df["anomalous_features"] = None
                 if anomalies_df.empty:
                     st.warning("No rows in anomalies CSV.")
                 else:
                     st.write(f"Loaded {len(anomalies_df)} anomalies from {st.session_state.detect_path} for labeling.")
                     
-                    # Merge with existing labeled anomalies if it exists
+                    # Merge with labeled anomalies if it exists
                     if os.path.exists(st.session_state.labeled_path):
                         labeled_previous = pd.read_csv(st.session_state.labeled_path)
-                        if "user_label" in labeled_previous.columns:
-                            # Merge on e.g. 'timestamp_str' + 'anomaly_score'
+                        if "anomalous_features" in labeled_previous.columns:
                             anomalies_df = anomalies_df.merge(
-                                labeled_previous[["timestamp_str", "anomaly_score", "user_label"]],
+                                labeled_previous[["timestamp_str", "anomaly_score", "anomalous_features"]],
                                 on=["timestamp_str", "anomaly_score"],
                                 how="left",
                                 suffixes=("", "_old")
                             )
-                            # Combine user_label if new is None but old is not
-                            anomalies_df["user_label"] = anomalies_df["user_label"].combine_first(anomalies_df["user_label_old"])
-                            anomalies_df.drop(columns=["user_label_old"], inplace=True, errors='ignore')
+                            anomalies_df["anomalous_features"] = anomalies_df["anomalous_features"].combine_first(
+                                anomalies_df["anomalous_features_old"]
+                            )
+                            anomalies_df.drop(columns=["anomalous_features_old"], inplace=True, errors='ignore')
 
-                    # Create columns in anomalies_df to identify numeric_id from file mapping
+                    # file_mapping-based grouping
                     mapping_dict = load_file_mapping("data/file_mapping.json")
                     anomalies_df["original_file_id"] = anomalies_df["timestamp_str"].apply(parse_original_id)
                     anomalies_df["numeric_id"] = anomalies_df["original_file_id"].apply(lambda x: mapping_dict.get(x, None))
-                    # Drop anomalies that don't match a numeric_id in the mapping
                     anomalies_df = anomalies_df.dropna(subset=["numeric_id"]).copy()
                     anomalies_df["numeric_id"] = anomalies_df["numeric_id"].astype(int)
                     
                     if anomalies_df.empty:
-                        st.warning("All anomalies were filtered out because no matching numeric_id was found in file_mapping.json.")
+                        st.warning("No matching numeric_id was found in file_mapping.json for these anomalies.")
                     else:
                         # Group by numeric_id
                         grouped = anomalies_df.groupby("numeric_id")
-                        # Convert to a dict of dataframes
                         anomaly_groups = {nid: g.reset_index(drop=True) for nid, g in grouped}
 
-                        # Initialize session_state
-                        if "labeled_groups" not in st.session_state:
-                            st.session_state.labeled_groups = anomaly_groups
-                        if "file_ids_in_order" not in st.session_state:
-                            st.session_state.file_ids_in_order = sorted(anomaly_groups.keys())
+                        # Store in session_state
+                        st.session_state.labeled_groups = anomaly_groups
+                        st.session_state.file_ids_in_order = sorted(anomaly_groups.keys())
+
+                        # Indices
                         if "file_idx" not in st.session_state:
                             st.session_state.file_idx = 0
                         if "anomaly_idx" not in st.session_state:
                             st.session_state.anomaly_idx = 0
 
-                        # --------------------------------------------------------------------------------
-                        # Jump to the first unlabeled entry in the entire dataset
-                        found_unlabeled = False
-                        for i, fid in enumerate(st.session_state.file_ids_in_order):
-                            df_fid = st.session_state.labeled_groups[fid]
-                            unlabeled_indices = df_fid[df_fid["user_label"].isna()].index
-                            if len(unlabeled_indices) > 0:
-                                st.session_state.file_idx = i
-                                st.session_state.anomaly_idx = unlabeled_indices[0]
-                                found_unlabeled = True
-                                break
-                        if not found_unlabeled:
-                            # Means all labeled for all files
-                            st.session_state.file_idx = len(st.session_state.file_ids_in_order)
-                        # --------------------------------------------------------------------------------
+                        # Persist selection
+                        if "selected_anomalous_features" not in st.session_state:
+                            st.session_state.selected_anomalous_features = []
+                        if "last_shown_anomaly" not in st.session_state:
+                            st.session_state.last_shown_anomaly = (None, None)
 
                         def save_labeled_anomalies():
                             """
-                            Gather all labeled groups from session_state and save
-                            to the labeled CSV.
+                            Gather labeled data from session_state and save them to CSV.
                             """
                             all_dfs = []
                             for fid in st.session_state.labeled_groups:
                                 all_dfs.append(st.session_state.labeled_groups[fid])
                             labeled_all = pd.concat(all_dfs, ignore_index=True)
-                            labeled_all.to_csv(st.session_state.labeled_path, index=False)
 
-                        # If we've labeled all files, show a success
+                            # Adjust final columns so we include all relevant features:
+                            final_cols = [
+                                "timestamp_str",
+                                "SFN", "Slot", "CC", "HARQ", "MCS", "CRC", "ReTx", "NDI",
+                                "threshold", "anomaly_score", "anomalous_features",
+                            ]
+                            # Ensure we have them; fill missing columns with ""
+                            for c in final_cols:
+                                if c not in labeled_all.columns:
+                                    labeled_all[c] = ""
+                            labeled_all = labeled_all[final_cols]
+
+                            labeled_all.to_csv(st.session_state.labeled_path, index=False)
+                            return labeled_all
+
+                        def move_to_next_anomaly():
+                            st.session_state.anomaly_idx += 1
+                            st.session_state.selected_anomalous_features = []
+                            st.session_state.last_shown_anomaly = (
+                                st.session_state.file_idx,
+                                st.session_state.anomaly_idx
+                            )
+
+                        # ---------------- Check if we have leftover files ----------
                         if st.session_state.file_idx >= len(st.session_state.file_ids_in_order):
                             st.success("No more anomalies to label! All files have been processed.")
-                            if st.button("Save labeled anomalies to CSV"):
-                                save_labeled_anomalies()
-                                st.success(f"Labeled anomalies saved to {st.session_state.labeled_path}.")
                             return
 
                         current_file_id = st.session_state.file_ids_in_order[st.session_state.file_idx]
                         current_df = st.session_state.labeled_groups[current_file_id]
 
-                        # If we've gone past the last anomaly for this file, move to next file
+                        # If we've exceeded the anomalies in the current file, move to next file
                         if st.session_state.anomaly_idx >= len(current_df):
                             st.session_state.file_idx += 1
                             st.session_state.anomaly_idx = 0
@@ -314,129 +297,150 @@ def app_main():
                         if len(current_df) == 0:
                             st.warning(f"No anomalies for file_id={current_file_id}. Moving on.")
                             st.session_state.file_idx += 1
+                            st.session_state.anomaly_idx = 0
                             st.rerun()
 
-                        # Let user pick window sizes
-                        st.subheader("Labeling Controls")
-                        ccol1, ccol2 = st.columns([3, 1], gap="large")
-                        with ccol2:
-                            window_before = st.number_input("Rows before anomaly", min_value=0, value=20, step=1)
-                            window_after = st.number_input("Rows after anomaly", min_value=0, value=20, step=1)
-                        
                         anomaly_idx = st.session_state.anomaly_idx
                         anomaly_row = current_df.iloc[anomaly_idx]
+                        timestamp_str = anomaly_row["timestamp_str"]
 
-                        # Prepare main layout
-                        with ccol1:
-                            # Display file info
-                            possible_keys = [k for k, v in mapping_dict.items() if v == current_file_id]
-                            if possible_keys:
-                                file_key_str = possible_keys[0]
+                        # Possibly load previously labeled features
+                        already_labeled = anomaly_row.get("anomalous_features", "")
+                        if (st.session_state.file_idx, st.session_state.anomaly_idx) != st.session_state.last_shown_anomaly:
+                            if pd.notna(already_labeled) and len(already_labeled.strip()) > 0:
+                                st.session_state.selected_anomalous_features = [
+                                    f.strip() for f in already_labeled.split(",") if f.strip()
+                                ]
                             else:
-                                file_key_str = f"ID={current_file_id}"
-                            
-                            st.markdown(
-                                f"### File {file_key_str}.csv (numeric_id={current_file_id})"
-                                f" - Anomaly {anomaly_idx+1} / {len(current_df)}"
+                                st.session_state.selected_anomalous_features = []
+                            st.session_state.last_shown_anomaly = (
+                                st.session_state.file_idx,
+                                st.session_state.anomaly_idx
                             )
+
+                        # --- Layout: main column vs. side column ---
+                        ccol_main, ccol_side = st.columns([3, 1], gap="large")
+
+                        with ccol_main:
+                            # Show Feature Values in row format
+                            st.markdown(f"### Anomaly {anomaly_idx+1} / {len(current_df)} for File ID={current_file_id}")
                             score = anomaly_row.get("anomaly_score", None)
                             dist = anomaly_row.get("distance_from_threshold", None)
                             threshold = anomaly_row.get("threshold", None)
-                            timestamp_str = anomaly_row["timestamp_str"]
 
                             st.write(f"**timestamp_str**: {timestamp_str}")
                             st.write(f"**Anomaly Score**: {score}")
                             st.write(f"**Threshold**: {threshold}")
                             st.write(f"**Distance**: {dist}")
 
-                            # For clarity, let's show original vs predicted columns if needed
+                            # Original vs predicted columns
                             columns_to_hide = {
                                 "timestamp_str", "anomaly_score", 
                                 "distance_from_threshold", "threshold",
-                                "original_file_id", "numeric_id", "user_label"
+                                "original_file_id", "numeric_id", "anomalous_features"
                             }
                             anomaly_display_cols = [c for c in anomaly_row.index if c not in columns_to_hide]
                             orig_cols = [c for c in anomaly_display_cols if not c.endswith("_p")]
                             pred_cols = [c for c in anomaly_display_cols if c.endswith("_p")]
 
                             if orig_cols or pred_cols:
-                                st.write("**Feature Values**")
-                                combined_df = pd.DataFrame({
-                                    "Original": anomaly_row[orig_cols].values if orig_cols else [],
-                                    "Predicted": anomaly_row[pred_cols].values if pred_cols else []
-                                })
-                                row_labels = orig_cols if orig_cols else pred_cols
-                                if len(row_labels) == len(combined_df):
-                                    combined_df.index = row_labels
-                                st.dataframe(combined_df, use_container_width=True)
-
-                        # --- Show a window of unscaled data around this anomaly ---
-                        file_data = load_parquet_for_file(current_file_id, st.session_state.params.parquet_path)
-                        if file_data is not None and not file_data.empty:
-                            matched_rows = file_data[file_data["timestamp_str"] == timestamp_str]
-                            if len(matched_rows) == 0:
-                                st.warning(f"No match for timestamp_str={timestamp_str} in file_id={current_file_id}.")
-                            else:
-                                matched_idx = matched_rows.index[0]
-                                start_idx = max(0, matched_idx - window_before)
-                                end_idx = min(len(file_data), matched_idx + window_after + 1)
-
-                                df_window = file_data.iloc[start_idx:end_idx].copy()
-                                # remove columns we don't want to see
-                                drop_cols = ["file_id", "timestamp_str"]
-                                for dc in drop_cols:
-                                    if dc in df_window.columns:
-                                        df_window.drop(columns=[dc], inplace=True)
-                                # unscale
-                                df_window = unscale_features(df_window)
-
-                                def highlight_anomaly_row(row):
-                                    return [
-                                        "background-color: yellow" if row.name == matched_idx else ""
-                                        for _ in row
-                                    ]
-
-                                st.markdown(
-                                    f"**Data Window** (± {window_before} / {window_after} rows around index {matched_idx})"
+                                st.markdown("**Feature Values** (rows = Original / Predicted, columns = features)")
+                                # Create a 2-row DataFrame: row1=Original values, row2=Predicted values
+                                # We'll use `orig_cols` as the reference columns
+                                # (If you need to unify or reorder columns, adjust accordingly)
+                                df_feat = pd.DataFrame(
+                                    [
+                                        anomaly_row[orig_cols].values if orig_cols else [],
+                                        anomaly_row[pred_cols].values if pred_cols else []
+                                    ],
+                                    index=["Original", "Predicted"],
+                                    columns=orig_cols
                                 )
-                                styled_window = df_window.style.apply(highlight_anomaly_row, axis=1)
-                                st.dataframe(styled_window, use_container_width=True)
-                        else:
-                            st.warning("No data found in the Parquet for this file.")
+                                st.dataframe(df_feat, use_container_width=True)
 
-                        # Labeling buttons
-                        with ccol2:
-                            st.write("---")
-                            anomaly_button = st.button("Mark ANOMALY")
-                            normal_button = st.button("Mark NORMAL")
-                            partial_save_button = st.button("Save to MLflow")
+                            # Show unscaled data window
+                            file_data = load_parquet_for_file(current_file_id, st.session_state.params.parquet_path)
+                            if file_data is not None and not file_data.empty:
+                                matched_rows = file_data[file_data["timestamp_str"] == timestamp_str]
+                                if len(matched_rows) == 0:
+                                    st.warning(f"No match for timestamp_str={timestamp_str} in file_id={current_file_id}.")
+                                else:
+                                    matched_idx = matched_rows.index[0]
+                                    # We'll set defaults for window_before & window_after for demonstration
+                                    # (though we do them in ccol_side)
+                                    window_before = 20
+                                    window_after = 20
+                                    
+                                    if "window_before" in st.session_state:
+                                        window_before = st.session_state.window_before
+                                    if "window_after" in st.session_state:
+                                        window_after = st.session_state.window_after
 
-                            if anomaly_button:
-                                current_df.loc[anomaly_idx, "user_label"] = True
+                                    start_idx = max(0, matched_idx - window_before)
+                                    end_idx = min(len(file_data), matched_idx + window_after + 1)
+
+                                    df_window = file_data.iloc[start_idx:end_idx].copy()
+                                    drop_cols = ["file_id", "timestamp_str"]
+                                    for dc in drop_cols:
+                                        if dc in df_window.columns:
+                                            df_window.drop(columns=[dc], inplace=True)
+                                    df_window = unscale_features(df_window)
+
+                                    def highlight_anomaly_row(row):
+                                        return [
+                                            "background-color: yellow" if row.name == matched_idx else ""
+                                            for _ in row
+                                        ]
+
+                                    st.markdown(f"**Data Window** (± {window_before} / {window_after} rows)")
+                                    styled_window = df_window.style.apply(highlight_anomaly_row, axis=1)
+                                    st.dataframe(styled_window, use_container_width=True)
+                            else:
+                                st.warning("No data found in the Parquet for this file.")
+
+                        with ccol_side:
+                            # Let user pick how many rows before/after
+                            # Store them in session_state so the main col can use them
+                            st.session_state.window_before = st.number_input(
+                                "Rows before anomaly",
+                                min_value=0, value=20, step=1
+                            )
+                            st.session_state.window_after = st.number_input(
+                                "Rows after anomaly",
+                                min_value=0, value=20, step=1
+                            )
+
+                            # Multiselect for anomalous features
+                            st.markdown("**Anomalous Features**")
+                            selected_features = st.multiselect(
+                                label="",
+                                options=["SFN", "Slot", "CC", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
+                                default=st.session_state.selected_anomalous_features,
+                                key="feature_multiselect"
+                            )
+
+                            # Next anomaly button
+                            if st.button("Next Anomaly"):
+                                # Save selection
+                                if selected_features:
+                                    current_df.loc[anomaly_idx, "anomalous_features"] = ", ".join(selected_features)
+                                else:
+                                    current_df.loc[anomaly_idx, "anomalous_features"] = "Normal"
                                 st.session_state.labeled_groups[current_file_id] = current_df
-                                st.session_state.anomaly_idx += 1
-                                # Immediately save partial
-                                save_labeled_anomalies()
+
+                                # Immediately save to CSV
+                                labeled_all = save_labeled_anomalies()
+                                mlflow.log_artifact(
+                                    st.session_state.labeled_path,
+                                    artifact_path="labeled_results",
+                                    run_id=run_id
+                                )
+
+                                # Move on
+                                move_to_next_anomaly()
                                 st.rerun()
 
-                            if normal_button:
-                                current_df.loc[anomaly_idx, "user_label"] = False
-                                st.session_state.labeled_groups[current_file_id] = current_df
-                                st.session_state.anomaly_idx += 1
-                                # Immediately save partial
-                                save_labeled_anomalies()
-                                st.rerun()
-
-                            if partial_save_button:
-                                st.session_state.labeled_groups[current_file_id] = current_df
-                                save_labeled_anomalies()
-                                # Also log to MLflow
-                                mlflow.log_artifact(st.session_state.labeled_path, artifact_path="labeled_results", run_id=run_id)
-                                st.success("Labels saved to MLflow.")
-
-                        st.session_state.labeled_groups[current_file_id] = current_df
-
-    # ------------------- TAB 2: Attention Matrices ----------------------------
+# ------------------- TAB 2: Attention Matrices ----------------------------
     with tabs[2]:
         st.header("Attention Matrices")
         st.write("Displays attention matrices from the loaded model. Also logs them to MLflow each time.")
