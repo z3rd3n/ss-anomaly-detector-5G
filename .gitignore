@@ -1,6 +1,8 @@
 .tez
 data/scaled_pdsch.parquet
 data/scaled_pdsch_data/
+data/processed_pdsch_data/
+data/processed_pdsch_insights/
 *.parquet
 __pycache__/
 *reportable/
@@ -12,3 +14,5 @@ results/
 *.db
 *temp/
 *temp_mlflow/
+insights/plots/
+*.csv

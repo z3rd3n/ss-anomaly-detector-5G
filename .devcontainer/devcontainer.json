@@ -7,11 +7,12 @@
 	"customizations": {
 		"vscode": {
 			"extensions": [
-				"Optuna.optuna-dashboard"
+				"Optuna.optuna-dashboard",
+				"GitHub.copilot"
 			]
 		}
-	}
-	// "mounts": [
-	// 	"source=/c/Users/eranil/Documents/romes-anomaly/data/scaled_pdsch_data,target=/workspaces/thesis/data/scaled_pdsch_data,type=bind"
-	// ]
+	},
+	"mounts": [
+		"source=/c/Users/eranil/Documents/romes-anomaly/data/processed_pdsch_data,target=/workspaces/thesis/data/processed_pdsch_data,type=bind"
+	]
 }

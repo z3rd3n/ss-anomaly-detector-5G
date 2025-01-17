@@ -265,7 +265,7 @@ def detect_anomalies_from_threshold(params, model, val_loader, threshold=0.05):
         anomalies_df = anomalies_df.sort_values("anomaly_score", ascending=False)
         logging.info(f"Found {len(anomalies_df)} anomalies in total.")
 
-    anomalies_df.to_csv(f"temp_mlflow/anomalies_p{params.p}q{str(params.q)[2:]}v{int(params.validation_ratio * 100)}.csv", index=False)
+    anomalies_df.to_csv(f"temp_mlflow/anomalies_p{params.p}q{str(params.q)[2:]}v{int(params.validation_ratio * 100)}_th{threshold:.4f}.csv", index=False)
 
     return anomalies_df, None
 
