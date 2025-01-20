@@ -140,12 +140,14 @@ def generate_insights(db_path, table_name):
             id,
             ReTx,
             CRC,
-            LAG(CRC) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_crc
+            NDI,
+            LAG(CRC) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_crc,
+            LAG(NDI) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_ndi
         FROM {table_name}
     )
     SELECT id
     FROM windowed
-    WHERE ReTx = 0 AND prev_crc = 0;
+    WHERE ReTx = 0 AND prev_crc = 0 AND NDI = prev_ndi;
     """
 
     # --- "new_data_no_retx" ---
