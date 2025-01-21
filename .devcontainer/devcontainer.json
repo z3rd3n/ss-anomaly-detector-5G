@@ -13,6 +13,7 @@
 		}
 	},
 	"mounts": [
-		"source=/c/Users/eranil/Documents/romes-anomaly/data/processed_pdsch_data,target=/workspaces/thesis/data/processed_pdsch_data,type=bind"
+		"source=/c/Users/eranil/Documents/romes-anomaly/data/processed_pdsch_data,target=/workspaces/thesis/data/processed_pdsch_data,type=bind",
+		"source=/c/Users/eranil/Documents/romes-anomaly/data/pdsch_data_romes_clean,target=/workspaces/thesis/data/pdsch_data_romes_clean,type=bind"
 	]
 }

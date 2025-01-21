@@ -3,6 +3,7 @@ data/scaled_pdsch.parquet
 data/scaled_pdsch_data/
 data/processed_pdsch_data/
 data/processed_pdsch_insights/
+data/pdsch_data_romes_clean
 *.parquet
 __pycache__/
 *reportable/
@@ -16,3 +17,5 @@ results/
 *temp_mlflow/
 insights/plots/
 *.csv
+*.pkl
+*.json

@@ -19,7 +19,6 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     timestamp_str TEXT,
     SFN INTEGER,
     Slot INTEGER,
-    CC INTEGER,
     HARQ INTEGER,
     MCS INTEGER,
     CRC INTEGER,
@@ -70,19 +69,19 @@ def load_csv_into_db(csv_path, db_path, table_name):
     # Read the CSV with pandas
     df = pd.read_csv(csv_path)
     # Keep only relevant columns
-    needed_cols = ["timestamp_str", "SFN", "Slot", "CC", "HARQ", "MCS", "CRC", "ReTx", "NDI"]
+    needed_cols = ["timestamp_str", "SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]
     existing_cols = [c for c in needed_cols if c in df.columns]
     df = df[existing_cols].copy()
 
     # Convert to numeric where appropriate
-    for col in ["SFN", "Slot", "CC", "HARQ", "MCS", "CRC", "ReTx", "NDI"]:
+    for col in ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
 
     insert_query = f"""
     INSERT INTO {table_name} 
-    (timestamp_str, SFN, Slot, CC, HARQ, MCS, CRC, ReTx, NDI)
-    VALUES (?,?,?,?,?,?,?,?,?)
+    (timestamp_str, SFN, Slot, HARQ, MCS, CRC, ReTx, NDI)
+    VALUES (?,?,?,?,?,?,?,?)
     """
 
     # Insert row by row
@@ -91,7 +90,6 @@ def load_csv_into_db(csv_path, db_path, table_name):
             row.get("timestamp_str", ""),
             row.get("SFN", 0),
             row.get("Slot", 0),
-            row.get("CC", 0),
             row.get("HARQ", 0),
             row.get("MCS", 0),
             row.get("CRC", 0),
@@ -125,7 +123,7 @@ def generate_insights(db_path, table_name):
             id,
             ReTx,
             CRC,
-            LAG(CRC) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_crc
+            LAG(CRC) OVER (PARTITION BY HARQ ORDER BY id) AS prev_crc
         FROM {table_name}
     )
     SELECT id
@@ -141,8 +139,8 @@ def generate_insights(db_path, table_name):
             ReTx,
             CRC,
             NDI,
-            LAG(CRC) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_crc,
-            LAG(NDI) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_ndi
+            LAG(CRC) OVER (PARTITION BY HARQ ORDER BY id) AS prev_crc,
+            LAG(NDI) OVER (PARTITION BY HARQ ORDER BY id) AS prev_ndi
         FROM {table_name}
     )
     SELECT id
@@ -157,8 +155,8 @@ def generate_insights(db_path, table_name):
             id,
             CRC,
             NDI,
-            LAG(CRC) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_crc,
-            LAG(NDI) OVER (PARTITION BY CC, HARQ ORDER BY id) AS prev_ndi
+            LAG(CRC) OVER (PARTITION BY HARQ ORDER BY id) AS prev_crc,
+            LAG(NDI) OVER (PARTITION BY HARQ ORDER BY id) AS prev_ndi
         FROM {table_name}
     )
     SELECT id
@@ -228,8 +226,8 @@ def merge_insights_and_write_csv(db_path, table_name, row_insights, csv_output):
 # main() driver
 # ======================================================
 def main():
-    input_folder = "/workspaces/thesis/data/processed_pdsch_data/"
-    output_folder = "/workspaces/thesis/data/processed_pdsch_insights/"
+    input_folder = "/workspaces/thesis/data/pdsch_data_romes_clean/processed"
+    output_folder = "/workspaces/thesis/data/pdsch_data_romes_clean/insights"
     os.makedirs(output_folder, exist_ok=True)
     
     # List all CSV files in the input folder
