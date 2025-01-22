@@ -18,7 +18,8 @@ def start_logging(params=None, approach=None):
     if params is None and approach is None:
         output_dir = 'results'
     else:
-        experiment_name = f"q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
+        #experiment_name = f"q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
+        experiment_name = "surpriseTransformer"
         output_dir = os.path.join(output_dir, experiment_name)
         params.output_dir = output_dir
 
@@ -316,4 +317,12 @@ def bring_approach(args):
         train_func = train_model
         detect_func = detect_and_categorical_anomalies
         config = Config()
+
+    elif args.approach == 'surpriseTransformer':
+        from approaches.surpriseTransformer.trainer import train_function, detect_function
+        from approaches.surpriseTransformer.configClass import Config
+        train_func = train_function
+        detect_func = detect_function
+        config = Config()
+
     return config, train_func, detect_func
