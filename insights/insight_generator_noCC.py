@@ -226,7 +226,7 @@ def merge_insights_and_write_csv(db_path, table_name, row_insights, csv_output):
 # main() driver
 # ======================================================
 def main():
-    input_folder = "/workspaces/thesis/data/pdsch_data_romes_clean/processed"
+    input_folder = "/workspaces/thesis/data/pdsch_data_romes_clean/processed_legacy"
     output_folder = "/workspaces/thesis/data/pdsch_data_romes_clean/insights"
     os.makedirs(output_folder, exist_ok=True)
     
@@ -258,8 +258,6 @@ def main():
         # 4) Delete the .db file
         if os.path.exists(db_path):
             os.remove(db_path)
-            # Uncomment if you want a confirmation:
-            # print(f"[INFO] Deleted DB file: {db_path}")
 
 if __name__ == "__main__":
     main()

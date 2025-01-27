@@ -68,6 +68,12 @@ def main():
     if not files:
         print("No raw files found!")
         return
+    # Filter specific files
+    specific_files = ['001_cc1.csv', '003_cc0.csv', '009_cc0.csv']
+    files = [file for file in files if os.path.basename(file) in specific_files]
+    if not files:
+        print("No specific files found!")
+        return
 
     # Second pass: encode and save processed data
     for file_name in tqdm(files):

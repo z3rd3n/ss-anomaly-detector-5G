@@ -57,17 +57,13 @@ def save_checkpoint(model, optimizer, epoch, loss, params):
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
-        'optimizer_name': type(optimizer).__name__,  # Logging optimizer's class name
         'learning_rate': params.learning_rate if hasattr(params, 'learning_rate') else None,
-        'weight_decay': params.weight_decay if hasattr(params, 'weight_decay') else None
     }
 
     # Save the checkpoint
     torch.save(checkpoint, checkpoint_path)
     logging.info(f"Checkpoint saved: {checkpoint_path}")
-    logging.info(f"Optimizer used: {checkpoint['optimizer_name']}")
     logging.info(f"Epoch: {epoch}, Loss: {loss:.4f}")
 
     if hasattr(params, 'learning_rate'):
@@ -224,6 +220,9 @@ def unscale_features(features):
         # Create numpy arrays from the parameters    
         mean = np.array(scaling_params['mean_'])
         scale = np.array(scaling_params['scale_'])
+
+        mean = np.delete(mean, 2)
+        scale = np.delete(scale, 2)
         
         # Perform inverse transform manually: X_orig = X_scaled * scale + mean
         unscaled = features * scale + mean

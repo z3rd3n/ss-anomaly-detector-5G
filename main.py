@@ -49,14 +49,7 @@ def main(params, train_func, detect_func):
     if params.optimizer_name == 'AdamW':
         optimizer = optim.AdamW(model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
 
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
-        verbose=True
-    )
+    scheduler = None
 
     if params.train:
         logging.info("Starting training...")
@@ -71,9 +64,9 @@ def main(params, train_func, detect_func):
     if params.detect:
         logging.info("Starting detection...")
         anomalies_df, fig_path = detect_func(
-            params, 
             model, 
             val_loader, 
+            params, 
         )
         #anomalies_df.to_csv(f"{params.output_dir}_p{params.p}q{str(params.q)[-2:]}.csv", index=False)
 

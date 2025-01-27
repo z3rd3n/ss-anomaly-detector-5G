@@ -1,228 +1,174 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import math
 
-class AdaptiveSurpriseThreshold(nn.Module):
-    def __init__(self, input_dim, initial_threshold=0.7):
-        super().__init__()
-        # Initialize with a relatively high threshold (0.7) to focus on normal patterns
-        self.base_threshold = nn.Parameter(torch.tensor(initial_threshold))
-        self.adaptive_component = nn.Linear(input_dim, 1)
-        
-    def forward(self, x_t):
-        # x_t is shape [B, Seq, d_in] or [B, d_in]
-        # Combine base threshold with input-dependent adjustment
-        # We apply tanh(...) * 0.3 for ±0.3 range
-        adjustment = torch.tanh(self.adaptive_component(x_t)) * 0.3
-        # base_threshold is shape [], so broadcasting works
-        return torch.sigmoid(self.base_threshold + adjustment)
+class PositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEmbedding, self).__init__()
+        pe = torch.zeros(max_len, d_model).float()
+        pe.require_grad = False
 
-class DimensionProjection(nn.Module):
-    """Projects input features to higher dimension and back."""
-    def __init__(self, d_in: int, d_model: int):
-        super().__init__()
-        self.project_up = nn.Sequential(
-            nn.Linear(d_in, d_model),
-            nn.ReLU()
+        position = torch.arange(0, max_len).float().unsqueeze(1)
+        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return self.pe[:, :x.size(1)]
+
+class TokenEmbedding(nn.Module):
+    def __init__(self, c_in, d_model):
+        super(TokenEmbedding, self).__init__()
+        padding = 1 if torch.__version__ >= '1.5.0' else 2
+        layers = []
+        in_channels = c_in
+        while in_channels * 4 < d_model:
+            out_channels = in_channels * 4
+            layers.append(
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=3,
+                    padding=padding,
+                    padding_mode='circular',
+                    bias=False
+                )
+            )
+            layers.append(nn.BatchNorm1d(out_channels))
+            layers.append(nn.ReLU())
+            in_channels = out_channels
+        # Final layer to reach d_model
+        layers.append(
+            nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=d_model,
+                kernel_size=3,
+                padding=padding,
+                padding_mode='circular',
+                bias=False
+            )
         )
-        self.project_down = nn.Sequential(
-            nn.Linear(d_model, d_in)
-        )
-    
-    def forward_up(self, x: torch.Tensor) -> torch.Tensor:
-        return self.project_up(x)
-    
-    def forward_down(self, x: torch.Tensor) -> torch.Tensor:
-        return self.project_down(x)
+        layers.append(nn.BatchNorm1d(d_model))
+        layers.append(nn.ReLU())
+        self.tokenConv = nn.Sequential(*layers)
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
 
-class SurpriseMemory(nn.Module):
-    def __init__(self, d_in, d_model=128, d_ff=512, n_heads=4,
-                 mem_layers=2, learnable_surprise=True):
+    def forward(self, x):
+        x = self.tokenConv(x.permute(0, 2, 1)).transpose(1, 2)
+        return x
+
+class DataEmbedding(nn.Module):
+    def __init__(self, c_in, d_model):
+        super(DataEmbedding, self).__init__()
+
+        self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
+        self.position_embedding = PositionalEmbedding(d_model=d_model)
+
+    def forward(self, x):
+        x = self.value_embedding(x) + self.position_embedding(x)
+        return x
+
+class MemoryModule(nn.Module):
+    def __init__(self, d_model):
         super().__init__()
-        self.d_in = d_in
-        self.d_model = d_model
-
-        # Dimension projection
-        self.dim_proj = DimensionProjection(d_in, d_model)
-
-        # Key and Value projections (in higher dimensions)
-        self.W_Q = nn.Linear(d_model, d_model)
-        self.W_K = nn.Linear(d_model, d_model)
-        self.W_V = nn.Linear(d_model, d_model)
-
-        # Memory module (MLP)
-        memory_layers = []
-        memory_layers.append(nn.Linear(d_model, d_model))
-        memory_layers.append(nn.LayerNorm(d_model))
-        memory_layers.append(nn.ReLU())
-        for _ in range(mem_layers - 1):
-            memory_layers.append(nn.Linear(d_model, d_model))
-            memory_layers.append(nn.LayerNorm(d_model))
-            memory_layers.append(nn.ReLU())
-        self.memory_network = nn.Sequential(*memory_layers)
-
-        # Parameters for surprise mechanism
-        self.eta   = nn.Linear(d_in, 1)  # surprise decay
-        self.theta = nn.Linear(d_in, 1)  # learning rate
-        self.alpha = nn.Linear(d_in, 1)  # forgetting rate
-
-        self.learnable_surprise = learnable_surprise
-        if learnable_surprise:
-            self.surprise_threshold = AdaptiveSurpriseThreshold(d_in)
-        else:
-            self.surprise_threshold = 0.7  # Fixed threshold
-
-        # Memory update buffer
-        #  self.S shape: [d_model, d_model]
-        self.register_buffer('S', torch.zeros(d_model, d_model))
-
-        # Surprise history for normalization
-        self.register_buffer('surprise_history', torch.zeros(10000))
-        self.surprise_idx = 0
-
-        # Attention mechanism
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            batch_first=True
-        )
-
-        # Simple reconstructor
-        self.reconstructor = nn.Sequential(
-            nn.Linear(d_model, d_ff),
+        # For example, a small MLP to map k -> v_hat
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model//4),
             nn.ReLU(),
-            nn.Linear(d_ff, d_model),
+            nn.Linear(d_model//4, d_model),
+        )
+
+    def forward(self, k):
+        # Returns predicted value for the given key
+        v_hat = self.net(k)
+        return v_hat
+
+class Reconstructor(nn.Module):
+    def __init__(self, d_model, d_input):
+        super().__init__()
+        # e.g. some multi-head attention block
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        # ...
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=4, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4*d_model),
             nn.ReLU(),
+            nn.Linear(4*d_model, d_model),
         )
+        self.proj_out = nn.Linear(d_model, d_input)  # final down-project
 
-    def compute_reconstruction_loss(self, x_input, x_recon):
-        """Compute reconstruction loss"""
-        return F.mse_loss(x_recon, x_input)
-    
-    def compute_surprise_score(self, grads):
-        """Compute normalized surprise score from the network gradients."""
-        # 'grads' is a tuple of Tensors for each param
-        all_grads = []
-        for g in grads:
-            if g is not None:
-                all_grads.append(g.reshape(-1))
-        if len(all_grads) == 0:
-            # If for some reason we have no grads
-            return torch.tensor(0.0, device=grads[0].device if grads[0] is not None else 'cpu')
-        all_grads = torch.cat(all_grads, dim=0)
+    def forward(self, x_up, memory_module):
+        # x_up shape: [B, S, d_model]
+        # We'll treat them as queries & keys (toy example)
 
-        # L2 norm
-        surprise_magnitude = torch.norm(all_grads, p=2)
+        Q = self.W_q(x_up)  # [B, S, d_model]
+        K = self.W_k(x_up)  # [B, S, d_model]
+        # For each position, get V from memory
+        V_hat = memory_module(K).detach()  # shape [B, S, d_model]
 
-        # Normalize with running stats
-        if self.surprise_idx > 0:
-            mean = self.surprise_history[:self.surprise_idx].mean()
-            std = self.surprise_history[:self.surprise_idx].std() + 1e-6
-            normalized_surprise = (surprise_magnitude - mean) / std
-        else:
-            normalized_surprise = surprise_magnitude
+        attn_out, _ = self.attn(Q, K, V_hat)
 
-        # Update buffer
-        self.surprise_history[self.surprise_idx] = surprise_magnitude.detach()
-        self.surprise_idx = (self.surprise_idx + 1) % len(self.surprise_history)
-
-        return torch.sigmoid(normalized_surprise)  # [0,1] range
-    
-    def forward(self, x_t):
-        """
-        Forward pass: encode + reconstruct
-        x_t shape expected: [B, Seq, d_model]
-        Returns: x_recon shape [B, Seq, d_in]
-        """
-        q_t = self.W_Q(x_t)
-        k_t = self.W_K(x_t)
-        v_t = self.W_V(x_t)
-
-        # Pass Q through memory network to get retrieval
-        retrieval = self.memory_network(q_t)
-
-        # Multi-head attention
-        attn_outs, _ = self.cross_attn(
-            query=retrieval,  # [B, Seq, d_model]
-            key=k_t,
-            value=v_t
-        )
-        # Reconstruct in d_model space
-        x_recon = self.reconstructor(attn_outs)
-        # Project back down to d_in
-        x_recon = self.dim_proj.forward_down(x_recon)
+        # pass through feed-forward
+        ffn_out = self.ffn(attn_out)       # [B, S, d_model]
+        x_recon_up = ffn_out        # a typical residual connection, # I want it to be reconstructed, but surprise shouldn't be affected
+        x_recon = self.proj_out(x_recon_up)  # [B, S, d_input]
         return x_recon
+    
 
-    def update_memory(self, x_t, is_training=True):
+# Gating function example:
+class SurpriseGate(nn.Module):
+    def __init__(self, threshold=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(10.0))  # Steeper sigmoid
+        self.beta = nn.Parameter(torch.tensor(-1.0))
+
+    def forward(self, surprise):
+        # More aggressive gating based on a fixed threshold
+        gate = torch.sigmoid(-self.alpha * surprise + self.beta)
+        return gate
+    
+
+class SurpriseTransformer(nn.Module):
+    """
+    Single combined model that wraps:
+      - DataEmbedding
+      - MemoryModule
+      - Reconstructor
+      - SurpriseGate
+
+    This allows saving/loading *one* model checkpoint easily.
+    """
+    def __init__(self, d_in, d_model):
         """
-        x_t shape: [B, Seq, d_in]
-        Returns:
-            x_recon, recon_loss, assoc_loss, surprise_score
+        Args:
+            d_in (int): Input feature dimension (e.g. len(feature_columns))
+            d_model (int): Dimension for internal embedding/transformer feed-forward
         """
-        # 1) Project x_t up to d_model
-        x_up = self.dim_proj.forward_up(x_t)  # [B, Seq, d_model]
+        super().__init__()
+        self.embed = DataEmbedding(d_in, d_model)
+        self.memory_module = MemoryModule(d_model)
+        self.reconstructor = Reconstructor(d_model, d_in)
+        self.surprise_gate = SurpriseGate()
 
-        # 2) Create k_t, v_t
-        k_t = self.W_K(x_up)  # [B, Seq, d_model]
-        v_t = self.W_V(x_up)
+    def forward(self, x):
+        """
+        A simple forward pass example that does:
+          1) embed -> x_up
+          2) memory -> v_hat
+          3) reconstruct -> x_recon
+        and returns (x_up, v_hat, x_recon)
 
-        # 3) Compute per-sample scalars (currently shape [B, Seq, 1])
-        eta_t   = torch.sigmoid(self.eta(x_t))    # shape [B, Seq, 1]
-        theta_t = F.softplus(self.theta(x_t))     # shape [B, Seq, 1]
-        alpha_t = torch.sigmoid(self.alpha(x_t))  # shape [B, Seq, 1]
-
-        # 4) If learnable threshold, we get shape [B, Seq, 1] => reduce to scalar
-        if self.learnable_surprise:
-            threshold_tensor = self.surprise_threshold(x_t)  # [B, Seq, 1]
-            threshold_val = threshold_tensor.mean().item()
-        else:
-            threshold_val = float(self.surprise_threshold)  # e.g. 0.7
-
-        # 5) Forward pass through memory to get v_t_hat
-        v_t_hat = self.memory_network(k_t)  # [B, Seq, d_model]
-
-        # 6) Reconstruct the original x
-        x_recon = self.forward(x_up)  # [B, Seq, d_in]
-
-        # 7) Compute losses
-        assoc_loss = self.compute_reconstruction_loss(v_t_hat, v_t)
-        recon_loss = self.compute_reconstruction_loss(x_t, x_recon)
-
-        # 8) Compute gradient w.r.t. memory network
-        gradients = torch.autograd.grad(
-            assoc_loss,
-            self.memory_network.parameters(),
-            create_graph=True
-        )
-
-        # 9) Surprise score (0-dim tensor)
-        surprise_score = self.compute_surprise_score(gradients)
-
-        # 10) Memory update (only if training and surprise is below threshold)
-        if is_training:
-            if surprise_score.item() < threshold_val:
-                # (a) reduce the 3D scalars to single scalars for the entire batch
-                eta_val   = eta_t.mean()   # shape [] in PyTorch
-                theta_val = theta_t.mean()
-                alpha_val = alpha_t.mean()
-
-                # (b) S_new = eta_val * S
-                #     Then add -theta_val * gradient for each param with dim=2
-                S_new = eta_val * self.S
-
-                for param, grad in zip(self.memory_network.parameters(), gradients):
-                    if grad is None:
-                        continue
-                    # We only update memory-related parameters that are [d_model, d_model]
-                    if param.dim() == 2 and param.shape == (self.d_model, self.d_model):
-                        S_new = S_new + (-theta_val * grad)
-
-                self.S = S_new
-
-                # (c) Apply forgetting to each param in memory_network
-                with torch.no_grad():
-                    for param in self.memory_network.parameters():
-                        if param.dim() == 2 and param.shape == (self.d_model, self.d_model):
-                            param.data = (1.0 - alpha_val) * param.data + self.S
-
-        return x_recon, recon_loss, assoc_loss, surprise_score
+        In practice, your training code might do extra steps
+        (like gating, computing gradient-based surprise, etc.).
+        """
+        x_up = self.embed(x)                     # [B, S, d_model]
+        v_hat = self.memory_module(x_up)         # [B, S, d_model]
+        x_recon = self.reconstructor(x_up, self.memory_module)  # [B, S, d_in]
+        return x_up, v_hat, x_recon

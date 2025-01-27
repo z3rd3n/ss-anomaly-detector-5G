@@ -56,8 +56,8 @@ def process_pdsch_row(row):
     }
 
 def main():
-    data_dir = "/workspaces/thesis/data/pdsch_data_romes_clean/"
-    output_dir = "/workspaces/thesis/data/pdsch_data_romes_clean/processed/scaled"
+    data_dir = "/workspaces/thesis/data/pdsch_data_romes_clean/processed"
+    output_dir = "/workspaces/thesis/data/pdsch_data_romes_clean/scaled"
     os.makedirs(output_dir, exist_ok=True)
 
     feature_names = [
