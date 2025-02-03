@@ -129,7 +129,7 @@ class ParquetSequenceDataset(IterableDataset):
         try:
             features = torch.tensor(
                 chunk[self.feature_columns].values,
-                dtype=torch.float32
+                dtype=torch.long
             )
             timestamps = chunk['timestamp_str'].tolist()
 

@@ -8,22 +8,22 @@ import torch
 from datetime import datetime
 from scipy import stats
 import pandas as pd
-from scipy.signal import find_peaks
 
 
 def start_logging(params=None, approach=None):
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if approach is not None:
-        output_dir = os.path.join(approach, 'results')
-    if params is None and approach is None:
-        output_dir = 'results'
-    else:
-        #experiment_name = f"q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
-        experiment_name = "surpriseTransformer"
-        output_dir = os.path.join(output_dir, experiment_name)
-        params.output_dir = output_dir
+    # if approach is not None:
+    #     output_dir = os.path.join(approach, 'results')
+    # if params is None and approach is None:
+    #     output_dir = 'results'
+    # else:
+    #     #experiment_name = f"q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
+    #     experiment_name = "surpriseTransformer"
+    #     output_dir = os.path.join(output_dir, experiment_name)
+    #     params.output_dir = output_dir
 
-
+    # hard_coded
+    output_dir = params.output_dir
     log_dir = os.path.join(output_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'logTraining_{current_time}.log')

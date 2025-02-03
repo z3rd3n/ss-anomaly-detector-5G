@@ -2,173 +2,120 @@ import torch
 import torch.nn as nn
 import math
 
-class PositionalEmbedding(nn.Module):
+class SinusoidalPositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
-        super(PositionalEmbedding, self).__init__()
-        pe = torch.zeros(max_len, d_model).float()
-        pe.require_grad = False
-
-        position = torch.arange(0, max_len).float().unsqueeze(1)
-        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
-
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) *
+                             -(math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-
-        pe = pe.unsqueeze(0)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
         self.register_buffer('pe', pe)
-
     def forward(self, x):
-        return self.pe[:, :x.size(1)]
+        # x: [B, S, d_model]
+        return x + self.pe[:, :x.size(1)]
 
-class TokenEmbedding(nn.Module):
-    def __init__(self, c_in, d_model):
-        super(TokenEmbedding, self).__init__()
-        padding = 1 if torch.__version__ >= '1.5.0' else 2
-        layers = []
-        in_channels = c_in
-        while in_channels * 4 < d_model:
-            out_channels = in_channels * 4
-            layers.append(
-                nn.Conv1d(
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    kernel_size=3,
-                    padding=padding,
-                    padding_mode='circular',
-                    bias=False
-                )
-            )
-            layers.append(nn.BatchNorm1d(out_channels))
-            layers.append(nn.ReLU())
-            in_channels = out_channels
-        # Final layer to reach d_model
-        layers.append(
-            nn.Conv1d(
-                in_channels=in_channels,
-                out_channels=d_model,
-                kernel_size=3,
-                padding=padding,
-                padding_mode='circular',
-                bias=False
-            )
-        )
-        layers.append(nn.BatchNorm1d(d_model))
-        layers.append(nn.ReLU())
-        self.tokenConv = nn.Sequential(*layers)
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
 
+class MultiFeatureEmbedding(nn.Module):
+    """
+    Embeds each of the 7 discrete features and concatenates them.
+    """
+    def __init__(self, cardinalities, embed_dims):
+        super().__init__()
+        assert len(cardinalities) == len(embed_dims), "cardinalities and embed_dims must match in length."
+        self.embeddings = nn.ModuleList([nn.Embedding(c, d) for c, d in zip(cardinalities, embed_dims)])
+        self.total_dim = sum(embed_dims)
+        self.positional_embedding = SinusoidalPositionalEmbedding(self.total_dim)
     def forward(self, x):
-        x = self.tokenConv(x.permute(0, 2, 1)).transpose(1, 2)
-        return x
+        # x: [B, S, 7]
+        embs = []
+        for i, emb_layer in enumerate(self.embeddings):
+            emb_i = emb_layer(x[..., i])
+            embs.append(emb_i)
+        concatenated = torch.cat(embs, dim=-1)  # [B, S, total_dim]
+        return self.positional_embedding(concatenated)
 
-class DataEmbedding(nn.Module):
-    def __init__(self, c_in, d_model):
-        super(DataEmbedding, self).__init__()
-
-        self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
-        self.position_embedding = PositionalEmbedding(d_model=d_model)
-
-    def forward(self, x):
-        x = self.value_embedding(x) + self.position_embedding(x)
-        return x
 
 class MemoryModule(nn.Module):
+    """
+    A small MLP that maps the key to a value estimate.
+    """
     def __init__(self, d_model):
         super().__init__()
-        # For example, a small MLP to map k -> v_hat
         self.net = nn.Sequential(
-            nn.Linear(d_model, d_model//4),
+            nn.Linear(d_model, d_model // 4),
             nn.ReLU(),
-            nn.Linear(d_model//4, d_model),
+            nn.Linear(d_model // 4, d_model)
         )
-
     def forward(self, k):
-        # Returns predicted value for the given key
-        v_hat = self.net(k)
-        return v_hat
+        return self.net(k)
 
 class Reconstructor(nn.Module):
-    def __init__(self, d_model, d_input):
+    """
+    Uses a multihead attention block followed by an FFN and projects to produce logits for all features.
+    """
+    def __init__(self, d_model, cardinalities):
         super().__init__()
-        # e.g. some multi-head attention block
+        self.d_model = d_model
+        self.cardinalities = cardinalities
+        self.total_classes = sum(cardinalities)
         self.W_q = nn.Linear(d_model, d_model)
         self.W_k = nn.Linear(d_model, d_model)
-        # ...
         self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=4, batch_first=True)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4*d_model),
+            nn.Linear(d_model, 4 * d_model),
             nn.ReLU(),
-            nn.Linear(4*d_model, d_model),
+            nn.Linear(4 * d_model, d_model)
         )
-        self.proj_out = nn.Linear(d_model, d_input)  # final down-project
-
+        self.proj_out = nn.Linear(d_model, self.total_classes)
     def forward(self, x_up, memory_module):
-        # x_up shape: [B, S, d_model]
-        # We'll treat them as queries & keys (toy example)
-
-        Q = self.W_q(x_up)  # [B, S, d_model]
-        K = self.W_k(x_up)  # [B, S, d_model]
-        # For each position, get V from memory
-        V_hat = memory_module(K).detach()  # shape [B, S, d_model]
-
+        # x_up: [B, S, d_model]
+        Q = self.W_q(x_up)
+        K = self.W_k(x_up)
+        # Get V_hat from memory (detached so that reconstructor loss does not update memory_module)
+        V_hat = memory_module(K).detach()
         attn_out, _ = self.attn(Q, K, V_hat)
-
-        # pass through feed-forward
-        ffn_out = self.ffn(attn_out)       # [B, S, d_model]
-        x_recon_up = ffn_out        # a typical residual connection, # I want it to be reconstructed, but surprise shouldn't be affected
-        x_recon = self.proj_out(x_recon_up)  # [B, S, d_input]
-        return x_recon
+        ffn_out = self.ffn(attn_out)
+        logits = self.proj_out(ffn_out)  # [B, S, total_classes]
+        return logits
     
 
-# Gating function example:
 class SurpriseGate(nn.Module):
-    def __init__(self, threshold=1.0):
+    """
+    A learnable gating mechanism that returns 1 if surprise is below a learnable threshold,
+    and 0 otherwise. (In other words, if the surprise is too large the instance is ignored.)
+    """
+    def __init__(self, init_threshold=0.1):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(10.0))  # Steeper sigmoid
-        self.beta = nn.Parameter(torch.tensor(-1.0))
-
+        # Learnable threshold (if surprise is greater than this, gate is 0)
+        self.threshold = nn.Parameter(torch.tensor(init_threshold, dtype=torch.float32))
+    
     def forward(self, surprise):
-        # More aggressive gating based on a fixed threshold
-        gate = torch.sigmoid(-self.alpha * surprise + self.beta)
+        # Binary gate: if surprise is less than or equal to threshold -> 1, else 0.
+        gate = (surprise <= self.threshold).float()
         return gate
     
 
 class SurpriseTransformer(nn.Module):
     """
-    Single combined model that wraps:
-      - DataEmbedding
-      - MemoryModule
-      - Reconstructor
-      - SurpriseGate
-
-    This allows saving/loading *one* model checkpoint easily.
+    Combined model that embeds the multi-feature input, applies a memory module,
+    and reconstructs the input via attention.
     """
-    def __init__(self, d_in, d_model):
-        """
-        Args:
-            d_in (int): Input feature dimension (e.g. len(feature_columns))
-            d_model (int): Dimension for internal embedding/transformer feed-forward
-        """
+    def __init__(self, config):
         super().__init__()
-        self.embed = DataEmbedding(d_in, d_model)
+        self.config = config
+        self.embed_multi = MultiFeatureEmbedding(config.cardinalities, config.embed_dims)
+        d_model = self.embed_multi.total_dim
+        self.pos_embedding = SinusoidalPositionalEmbedding(d_model)
         self.memory_module = MemoryModule(d_model)
-        self.reconstructor = Reconstructor(d_model, d_in)
-        self.surprise_gate = SurpriseGate()
-
+        self.reconstructor = Reconstructor(d_model, config.cardinalities)
+        self.surprise_gate = SurpriseGate(init_threshold=config.surprise_threshold)
     def forward(self, x):
-        """
-        A simple forward pass example that does:
-          1) embed -> x_up
-          2) memory -> v_hat
-          3) reconstruct -> x_recon
-        and returns (x_up, v_hat, x_recon)
-
-        In practice, your training code might do extra steps
-        (like gating, computing gradient-based surprise, etc.).
-        """
-        x_up = self.embed(x)                     # [B, S, d_model]
-        v_hat = self.memory_module(x_up)         # [B, S, d_model]
-        x_recon = self.reconstructor(x_up, self.memory_module)  # [B, S, d_in]
-        return x_up, v_hat, x_recon
+        # x: [B, S, 7]
+        x_up = self.embed_multi(x)
+        x_up = self.pos_embedding(x_up)
+        v_hat = self.memory_module(x_up)
+        logits = self.reconstructor(x_up, self.memory_module)
+        return x_up, v_hat, logits
