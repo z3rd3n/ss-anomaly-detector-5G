@@ -72,7 +72,7 @@ def main(params, train_func, detect_func):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the main script with specified approach.")
-    parser.add_argument('--approach', type=str, default='surpriseTransformer', help='Specify the approach to use.')
+    parser.add_argument('--approach', type=str, default='sslgad', help='Specify the approach to use.')
     args = parser.parse_args()
         
 

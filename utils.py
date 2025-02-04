@@ -324,4 +324,11 @@ def bring_approach(args):
         detect_func = detect_function
         config = Config()
 
+    elif args.approach == 'sslgad':
+        from approaches.sslgad.trainer import train_sslgad, detect_sslgad
+        from approaches.sslgad.configClass import Config
+        train_func = train_sslgad
+        detect_func = detect_sslgad
+        config = Config()    
+
     return config, train_func, detect_func
