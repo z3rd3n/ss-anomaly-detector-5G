@@ -329,6 +329,13 @@ def bring_approach(args):
         from approaches.sslgad.configClass import Config
         train_func = train_sslgad
         detect_func = detect_sslgad
+        config = Config()
+
+    elif args.approach == 'tranad':
+        from approaches.tranAD.trainer import train_tranad, detect_tranad
+        from approaches.tranAD.configClass import Config
+        train_func = train_tranad
+        detect_func = detect_tranad
         config = Config()    
 
     return config, train_func, detect_func
