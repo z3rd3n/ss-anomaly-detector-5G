@@ -1,29 +1,24 @@
-# utils.py
-import logging
 import os
-import json
-import matplotlib.pyplot as plt
+import logging
+from datetime import datetime
 import numpy as np
 import torch
-from datetime import datetime
-from scipy import stats
+import torch.nn as nn
+import json
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from dataset import ParquetSequenceDataset, custom_collate_fn
+from torch.utils.data import DataLoader
 import pandas as pd
+from sklearn.decomposition import PCA
+import torch.nn.functional as F
 
+EPS = 1e-6
 
-def start_logging(params=None, approach=None):
+def start_logging(params=None):
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # if approach is not None:
-    #     output_dir = os.path.join(approach, 'results')
-    # if params is None and approach is None:
-    #     output_dir = 'results'
-    # else:
-    #     #experiment_name = f"q{str(params.q)[-2:]}p{params.p}_s{params.seq_len}_h{params.n_heads}_e{params.e_layers}_d{params.model_dim}"
-    #     experiment_name = "surpriseTransformer"
-    #     output_dir = os.path.join(output_dir, experiment_name)
-    #     params.output_dir = output_dir
-
-    # hard_coded
-    output_dir = params.output_dir
+    output_dir = params['output_dir'] if params and 'output_dir' in params else 'output'
+    os.makedirs(output_dir, exist_ok=True)
     log_dir = os.path.join(output_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'logTraining_{current_time}.log')
@@ -38,304 +33,375 @@ def start_logging(params=None, approach=None):
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console.setFormatter(formatter)
     logging.getLogger('').addHandler(console)
-
-    if params is not None:
+    if params:
         logging.info("Hyperparameters and settings:")
-        for key, value in vars(params).items():
+        for key, value in params.items():
             logging.info(f"{key}: {value}")
 
+def save_checkpoint(state: dict, filename: str):
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    torch.save(state, filename)
+    logging.info(f"Checkpoint saved to {filename}")
 
-def save_checkpoint(model, optimizer, epoch, loss, params):
-    # Define the checkpoint directory and ensure it exists
-    checkpoint_dir = os.path.join(params.output_dir, 'checkpoints')
-    os.makedirs(checkpoint_dir, exist_ok=True)  # Creates the directory if it doesn't exist
-
-    # Define the checkpoint file path
-    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
-
-    # Prepare the checkpoint dictionary
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'loss': loss,
-        'learning_rate': params.learning_rate if hasattr(params, 'learning_rate') else None,
-    }
-
-    # Save the checkpoint
-    torch.save(checkpoint, checkpoint_path)
-    logging.info(f"Checkpoint saved: {checkpoint_path}")
-    logging.info(f"Epoch: {epoch}, Loss: {loss:.4f}")
-
-    if hasattr(params, 'learning_rate'):
-        logging.info(f"Learning Rate: {params.learning_rate}")
-
-
-def load_checkpoint(model, optimizer, checkpoint_path):
-    """
-    Helper to load a checkpoint from checkpoint_path into model/optimizer
-    """
-    logging.info(f"Loading checkpoint from {checkpoint_path} ...")
-    device = next(model.parameters()).device
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    logging.info("Checkpoint loaded.")
-
-
-def plot_training_curves(train_losses, val_losses, output_dir):
-    """
-    Saves a PNG plot of train vs validation loss over epochs.
-    """
-    fig, ax = plt.subplots(figsize=(6,4))
-    ax.plot(train_losses, label='Train Loss')
-    ax.plot(val_losses, label='Val Loss')
-    ax.set_title('Training & Validation Loss')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Loss')
-    ax.legend()
-    fig.tight_layout()
-    save_path = os.path.join(output_dir, 'train_val_loss_curve.png')
-    plt.savefig(save_path)
-    plt.close(fig)
-    logging.info(f"Saved train/val loss curve to {save_path}")
-
-
-
-def plot_attention_matrices(
-    model, 
-    dataloader, 
-    device="cpu", 
-    max_plots=8, 
-    max_heads=4, 
-    sample_idx=0
-):
-    """
-    Returns a list of (title_string, figure) for each attention matrix plot.
-    We won't save to disk. We'll just generate them so we can show them in Streamlit.
-    """
-    import math
-
-    model.to(device)
-    model.eval()
-    plots = []
-    batch_count = 0
-    
-    for batch_idx, batch in enumerate(dataloader):
-        if batch_idx >= max_plots:
-            break
-        features = batch["features"].to(device)
-        with torch.no_grad():
-            enc_out, queries_list, keys_list = model(features)
-        
-        # For demonstration, let's say we just take the last layer's queries/keys:
-        # queries shape [B, L, H, D], keys shape [B, L, H, D]
-        if not queries_list:
-            logging.warning("queries_list is empty, skipping attention plotting.")
-            break
-        queries = queries_list[-1]  # shape [B, L, H, D]
-        keys = keys_list[-1]        # shape [B, L, H, D]
-        if sample_idx >= queries.shape[0]:
-            # skip if sample_idx not available
-            logging.warning(f"sample_idx={sample_idx} out of range for this batch, skipping.")
-            continue
-        
-        # Extract single sample
-        q_0 = queries[sample_idx]  # [L, H, D]
-        k_0 = keys[sample_idx]     # [L, H, D]
-        # rearr => [H, L, D]
-        q_0 = q_0.permute(1,0,2)
-        k_0 = k_0.permute(1,0,2)
-        # Compute attention per head => Q * K^T
-        d_k = q_0.size(-1)
-        scale = 1.0 / (d_k ** 0.5)
-        attn_matrices = torch.bmm(q_0, k_0.transpose(1,2)) * scale
-        attn_matrices = torch.softmax(attn_matrices, dim=-1)  # [H, L, L]
-
-        # We'll plot up to max_heads
-        num_heads = min(attn_matrices.size(0), max_heads)
-        num_cols = 2
-        num_rows = math.ceil(num_heads / num_cols)
-        fig, axes = plt.subplots(
-            nrows=num_rows,
-            ncols=num_cols,
-            figsize=(5*num_cols, 5*num_rows),
-            squeeze=False
-        )
-        fig.suptitle(f"Batch {batch_idx}, Sample {sample_idx}, {num_heads} heads")
-
-        for h in range(num_heads):
-            attn_head_h = attn_matrices[h].cpu().numpy()
-            r = h // num_cols
-            c = h % num_cols
-            ax = axes[r, c]
-            im = ax.imshow(attn_head_h, cmap="hot", aspect="auto")
-            ax.set_title(f"Head {h}")
-            ax.set_xlabel("Key positions")
-            ax.set_ylabel("Query positions")
-            fig.colorbar(im, ax=ax)
-        
-        # Hide any extra subplots if heads < num_rows*num_cols
-        for h in range(num_heads, num_rows*num_cols):
-            r = h // num_cols
-            c = h % num_cols
-            fig.delaxes(axes[r, c])
-
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        plots.append((f"Attention Batch{batch_idx}_Sample{sample_idx}", fig))
-        batch_count += 1
-    
-    return plots
-
-
-def plot_anomaly_scores(scores, threshold):
-    """
-    Returns (title_string, figure) for anomaly scores.
-    """
-    fig, ax = plt.subplots(figsize=(7, 3))
-    idx = np.arange(len(scores))
-    ax.plot(idx, scores, label="Anomaly Score")
-    ax.axhline(threshold, color='r', linestyle='--', label=f'Threshold={threshold:.2f}')
-    
-    # highlight anomalies
-    anomalies_mask = scores > threshold
-    ax.scatter(idx[anomalies_mask], scores[anomalies_mask], color='red', s=10, label='Detected Anomalies')
-    ax.set_title("Anomaly Scores")
-    ax.set_xlabel("Index")
-    ax.set_ylabel("Score")
-    ax.legend()
-    fig.tight_layout()
-    return ("Anomaly Scores", fig)
-
-def unscale_features(features):
-    scaler_json_path = "data/scaling_params.json"
-    # 1) Load scaling parameters
-    if not os.path.exists(scaler_json_path):
-        logging.warning("Scaling files not found; will save scaled features as-is.")
-        unscaled = features
+def load_checkpoint(filename: str, model: nn.Module, optimizer: torch.optim.Optimizer):
+    if os.path.isfile(filename):
+        checkpoint = torch.load(filename)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        epoch = checkpoint.get('epoch', 0)
+        best_f1 = checkpoint.get('best_f1', 0.0)
+        params = checkpoint.get('params', {})
+        logging.info(f"Loaded checkpoint '{filename}' (epoch {epoch}) with best F1: {best_f1:.4f}")
+        return epoch, best_f1, params
     else:
-        with open(scaler_json_path, 'r') as f:
-            scaling_params = json.load(f)
-            
-        # Create numpy arrays from the parameters    
-        mean = np.array(scaling_params['mean_'])
-        scale = np.array(scaling_params['scale_'])
+        logging.warning(f"No checkpoint found at '{filename}'")
+        return 0, 0.0, {}
+    
 
-        mean = np.delete(mean, 2)
-        scale = np.delete(scale, 2)
-        
-        # Perform inverse transform manually: X_orig = X_scaled * scale + mean
-        unscaled = features * scale + mean
 
-    # 2) Round to integers
-    unscaled = np.rint(unscaled).astype(int)
-    return unscaled
+def compute_features_statistics(train_loader, params, num_features):
+    """
+    Computes per-feature mean and variance from the training data.
+    The computed statistics are saved to a JSON file specified in params['features_stats_json'].
+    If the JSON file exists, load and return the statistics.
+    
+    Returns:
+        means: torch.FloatTensor of shape [num_features]
+        variances: torch.FloatTensor of shape [num_features]
+    """
+    stats_file = params['features_stats_json']
+    if os.path.exists(stats_file):
+        logging.info(f"Loading features statistics from {stats_file}")
+        with open(stats_file, 'r') as f:
+            stats = json.load(f)
+        means = torch.tensor(stats['means'], dtype=torch.float32)
+        variances = torch.tensor(stats['variances'], dtype=torch.float32)
+        return means, variances
+    
+    logging.info("Computing features statistics from training data...")
+    total_sum = torch.zeros(num_features, dtype=torch.float64)
+    total_sum_sq = torch.zeros(num_features, dtype=torch.float64)
+    count = 0
+    for batch in tqdm(train_loader, desc="Computing features statistics", unit="batch"):
+        # features: [B, T, num_features]
+        features = batch['features'].to(torch.float64)
+        B, T, F = features.shape
+        count += B * T
+        total_sum += features.sum(dim=(0,1))
+        total_sum_sq += (features**2).sum(dim=(0,1))
+    means = (total_sum / count).to(torch.float32)
+    variances = ((total_sum_sq / count) - (means.double()**2)).to(torch.float32)
+    stats = {'means': means.tolist(), 'variances': variances.tolist()}
+    with open(stats_file, 'w') as f:
+        json.dump(stats, f)
+    logging.info(f"Features statistics saved to {stats_file}")
+    return means, variances
 
-def unscale_and_save_anomalies(
-    timestamps,
-    features,
-    enc_outputs,
-    anomaly_scores,
-    threshold,
-    output_csv
-):
-  
-    unscaled = unscale_features(features)
-    predicted = unscale_features(enc_outputs)
+def unnormalize_features(normalized_tensor, means, variances):
+    """
+    Unnormalizes a tensor that was normalized using (x - mean)/sqrt(var+EPS).
+    Returns the unnormalized tensor cast to the nearest integer.
+    """
+    std = torch.sqrt(variances + EPS)
+    unnorm = normalized_tensor.float() * std + means
+    return torch.clamp(torch.round(unnorm), min=0).to(torch.int64)
 
-    anomaly_indices = np.where(anomaly_scores >= threshold)[0]
-    logging.info(f"Total anomaly count: {len(anomaly_indices)} from {len(anomaly_scores)} ratio {len(anomaly_indices)/len(anomaly_scores)} (threshold={threshold})")
+def compute_anomaly_scores(model, batch, means, variances, ignore_indices={0, 1, 2}):
+    """
+    Given a batch (with key 'features') and the trained model,
+    returns a tensor of anomaly scores of shape [B, T].
+    The anomaly score for each timestep is computed as the sum of per-feature MSE errors.
+    
+    Features in ignore_indices are excluded from the sum.
+    """
+    features = batch['features'].to(next(model.parameters()).device)  # [B, T, num_features]
+    outputs = model(features)  # List of outputs; each: [B, T, 1]
+    batch_size, seq_len, num_features = features.shape
+    
+    scores = torch.zeros(batch_size, seq_len, device=features.device)
+    
+    for i in range(num_features):
+        if i not in ignore_indices:  # Exclude ignored indices from computation
+            target = features[:, :, i:i+1]
+            pred = outputs[i]
+            mse = (pred - target) ** 2  # [B, T, 1]
+            scores += mse.squeeze(-1)  # [B, T]
+    
+    return scores
 
-    if len(anomaly_indices) == 0:
-        logging.info(f"No anomalies found above threshold = {threshold}. No CSV created.")
+
+def produce_anomalies(model, val_loader, params, means, variances):
+    """
+    Iterates through the validation loader, computing anomaly scores per timestep.
+    Unnormalizes the predicted and true feature values before reporting.
+    Returns a DataFrame of anomalies (with timestamps, anomaly scores, true and predicted features)
+    and the threshold used.
+    """
+    model.eval()
+    all_scores = []
+    anomaly_candidates = []
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        with tqdm(total=len(val_loader), desc=f"Validation", unit="batch") as val_bar:
+            for batch in val_loader:
+                recon_scores = compute_anomaly_scores(model, batch, means, variances)
+                scores = recon_scores
+
+                batch_timestamps = batch['timestamps']
+                features_tensor = batch['features'].to(device)
+                outputs = model(features_tensor)
+                
+                # Since outputs is a list (one per feature), rebuild predictions and unnormalize both predicted and true features.
+                pred_list = []
+                for i in range(len(outputs)):
+                    pred_list.append(outputs[i].detach().cpu())
+                # Stack to shape [B, T, num_features]
+                pred_tensor = torch.cat(pred_list, dim=-1)
+                # Unnormalize predictions and true features
+                unnorm_pred = unnormalize_features(pred_tensor, means.to(pred_tensor.device), variances.to(pred_tensor.device))
+                unnorm_true = unnormalize_features(features_tensor, means.to(features_tensor.device), variances.to(features_tensor.device))
+                scores_np = scores.detach().cpu().numpy()
+                unnorm_pred_np = unnorm_pred.cpu().numpy()
+                unnorm_true_np = unnorm_true.cpu().numpy()
+                
+                for i in range(scores_np.shape[0]):
+                    for j in range(scores_np.shape[1]):
+                        score = scores_np[i, j]
+                        candidate = {
+                            'timestamp': str(batch_timestamps[i][j]),
+                            'anomaly_score': score,
+                            'true_features': unnorm_true_np[i, j].tolist(),
+                            'predicted_features': unnorm_pred_np[i, j].tolist(),
+                        }
+                        all_scores.append(score)
+                        anomaly_candidates.append(candidate)
+                val_bar.update(1)
+    if len(all_scores) == 0:
+        threshold = 0.0
+    else:
+        threshold = np.percentile(all_scores, params['percentile'])
+    anomalies = [candidate for candidate in anomaly_candidates if candidate['anomaly_score'] > threshold]
+    anomalies_df = pd.DataFrame(anomalies)
+    if not anomalies_df.empty:
+        anomalies_df = anomalies_df.sort_values(by='anomaly_score', ascending=False)
+        anomalies_df = anomalies_df.drop_duplicates(subset='timestamp')
+
+    #plot_latent_space(model, val_loader, params, device)
+    return anomalies_df, threshold
+
+def validate_csv(model, params, means, variances):
+    """
+    Validates the model on validation data (now from a parquet file) by computing anomaly scores
+    and comparing against ground truth extracted from the parquet.
+    
+    Ground truth is built by taking only those rows that have a valid 'insight' column,
+    keeping only the 'timestamp_str' and 'insight' columns.
+    """
+    logging.info("Starting Parquet validation procedure...")
+
+    # Create the validation dataset from the parquet file.
+    val_dataset = ParquetSequenceDataset(
+        parquet_path=params['validation_parquet_path'],  # New validation parquet file
+        feature_columns=params['feature_columns'],
+        seq_len=params['seq_len'],
+        stride=params['stride'],
+        split='train',
+        validation_ratio=0.0,
+        seed=params['seed'],
+        skip_anomalies=False,
+        normalization_stats={'means': means, 'variances': variances}
+    )
+    val_loader = DataLoader(val_dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=custom_collate_fn)
+
+    # Compute anomalies using the existing procedure.
+    anomalies_df, _ = produce_anomalies(model, val_loader, params, means, variances)
+    if anomalies_df.empty:
+        logging.warning("No anomalies detected during validation!")
+        return 0.0, 0.0, 0.0
+
+    # Ensure anomaly timestamps are strings.
+    anomalies_df["timestamp"] = anomalies_df["timestamp"].astype(str)
+
+    # Load the ground truth parquet.
+    df_gt = pd.read_parquet(params['validation_parquet_path'], columns=['timestamp_str', 'insight'])
+    # Ensure both required columns exist.
+    if "timestamp_str" not in df_gt.columns or "insight" not in df_gt.columns:
+        raise ValueError("Expected both 'timestamp_str' and 'insight' columns in the validation parquet file!")
+    
+    # Filter to only take rows where 'insight' is not null, then keep only the two columns.
+    df_gt_filtered = df_gt[df_gt['insight'].notna()][["timestamp_str", "insight"]]
+    # Convert timestamps to strings.
+    df_gt_filtered["timestamp_str"] = df_gt_filtered["timestamp_str"].astype(str)
+    # Create a set of ground truth timestamps.
+    gt_timestamps = set(df_gt_filtered["timestamp_str"].unique())
+
+    # Mark anomalies as accurate if their timestamp is in the ground truth.
+    anomalies_df["is_accurate"] = anomalies_df["timestamp"].apply(lambda ts: ts in gt_timestamps)
+
+    # Compute precision, recall, and F1-score.
+    num_accurate = anomalies_df["is_accurate"].sum()
+    total_anoms = len(anomalies_df)
+    total_gt = len(gt_timestamps)
+    precision = (num_accurate / total_anoms) if total_anoms > 0 else 0.0
+    recall = (num_accurate / total_gt) if total_gt > 0 else 0.0
+    f1_score = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    logging.info(f"Total anomalies reported by model: {total_anoms}")
+    logging.info(f"Total ground truth anomalies (with insight): {total_gt}")
+    logging.info(f"Total accurate detections: {num_accurate}")
+    logging.info(f"[RESULT] Validation - Precision: {precision*100:.2f}%, Recall: {recall*100:.2f}%, F1-Score: {f1_score*100:.2f}%")
+
+    anomalies_df = anomalies_df.sort_values(by='anomaly_score', ascending=False)
+    anomalies_csv_path = os.path.join(params['output_dir'], 'sorted_anomalies.csv')
+    anomalies_df.to_csv(anomalies_csv_path, index=False)
+    logging.info(f"Sorted anomalies saved to {anomalies_csv_path}")
+
+    # Generate CSV of ground truth anomalies missed by the model.
+    detected_gt_timestamps = set(anomalies_df[anomalies_df["is_accurate"]]["timestamp"])
+    missed_gt_timestamps = gt_timestamps - detected_gt_timestamps
+    missed_df = df_gt_filtered[df_gt_filtered["timestamp_str"].isin(missed_gt_timestamps)]
+    missed_csv_path = os.path.join(params['output_dir'], 'missed_ground_truth_anomalies.csv')
+    missed_df.to_csv(missed_csv_path, index=False)
+    logging.info(f"Missed ground truth anomalies saved to {missed_csv_path}")
+
+    if not df_gt_filtered.empty:
+        detected_gt_df = anomalies_df[anomalies_df["is_accurate"]].merge(
+            df_gt_filtered, left_on='timestamp', right_on='timestamp_str', how='left'
+        )
+        detection_counts = detected_gt_df['insight'].value_counts().sort_index()
+        total_counts = df_gt_filtered['insight'].value_counts().sort_index()
+        detection_rate = (detection_counts / total_counts * 100).fillna(0)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        detection_rate.plot(kind='bar', ax=ax)
+        ax.set_xlabel("Anomaly Type")
+        ax.set_ylabel("Detection Rate (%)")
+        ax.set_title("Detection Rate by Anomaly Type")
+        plt.tight_layout()
+        detection_rate_plot_path = os.path.join(params['output_dir'], 'anomaly_detection_rates.png')
+        plt.savefig(detection_rate_plot_path)
+        plt.close()
+        logging.info(f"Anomaly detection rates plot saved to {detection_rate_plot_path}")
+    else:
+        logging.warning("No valid ground truth rows with 'insight' available; skipping detection rate plot.")
+
+    # (b) Histogram of anomaly scores.
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.hist(anomalies_df['anomaly_score'], bins=50, color='skyblue', edgecolor='black')
+    ax.set_xlabel("Anomaly Score")
+    ax.set_ylabel("Frequency")
+    ax.set_title("Histogram of Anomaly Scores")
+    histogram_plot_path = os.path.join(params['output_dir'], 'anomaly_score_histogram.png')
+    plt.tight_layout()
+    plt.savefig(histogram_plot_path)
+    plt.close()
+    logging.info(f"Anomaly score histogram saved to {histogram_plot_path}")
+
+    # (c) Boxplot of anomaly scores by anomaly type (if available).
+    if not df_gt_filtered.empty:
+        detected_gt_df = anomalies_df[anomalies_df["is_accurate"]].merge(
+            df_gt_filtered, left_on='timestamp', right_on='timestamp_str', how='left'
+        )
+        if not detected_gt_df.empty:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            detected_gt_df.boxplot(column='anomaly_score', by='insight', ax=ax)
+            ax.set_xlabel("Anomaly Type")
+            ax.set_ylabel("Anomaly Score")
+            ax.set_title("Anomaly Score Distribution by Anomaly Type")
+            plt.suptitle("")
+            boxplot_path = os.path.join(params['output_dir'], 'anomaly_score_boxplot_by_insight.png')
+            plt.tight_layout()
+            plt.savefig(boxplot_path)
+            plt.close()
+            logging.info(f"Anomaly score boxplot by insight saved to {boxplot_path}")
+    # -------------------------------------------------------------------
+
+    return precision, recall, f1_score
+
+def plot_latent_space(model, val_loader, params):
+    """
+    Extracts latent representations from the validation loader and plots them
+    using PCA. Supports 2D or 3D plotting depending on the number of components.
+    """
+    model.eval()
+    all_latents = []
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        for batch in val_loader:
+            features = batch['features'].to(device)
+            # If the model supports returning latents, e.g., via an optional flag
+            outputs, latents = model(features, return_latents=True)
+            all_latents.append(latents.cpu().numpy())
+    if not all_latents:
+        logging.warning("No latent representations found for plotting.")
         return
+    all_latents = np.concatenate(all_latents, axis=0)
+    n_components = params.get('pca_n_components', 3)
+    pca = PCA(n_components=n_components)
+    latent_pca = pca.fit_transform(all_latents)
+    explained_variance = pca.explained_variance_ratio_
     
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-
-    if len(anomaly_indices) > 0:
-        anomalies = pd.DataFrame({
-            'timestamp_str': [timestamps[i] for i in anomaly_indices],
-            'SFN': unscaled[anomaly_indices, 0].astype(int),
-            'SFN_p': predicted[anomaly_indices, 0].astype(int),
-            'Slot': unscaled[anomaly_indices, 1].astype(int),
-            'Slot_p': predicted[anomaly_indices, 1].astype(int),
-            'CC': unscaled[anomaly_indices, 2].astype(int),
-            'CC_p': predicted[anomaly_indices, 2].astype(int),
-            'HARQ': unscaled[anomaly_indices, 3].astype(int),
-            'HARQ_p': predicted[anomaly_indices, 3].astype(int),
-            'MCS': unscaled[anomaly_indices, 4].astype(int),
-            'MCS_p': predicted[anomaly_indices, 4].astype(int),
-            'CRC': unscaled[anomaly_indices, 5].astype(int),
-            'CRC_p': predicted[anomaly_indices, 5].astype(int),
-            'ReTx': unscaled[anomaly_indices, 6].astype(int),
-            'ReTx_p': predicted[anomaly_indices, 6].astype(int),
-            'NDI': unscaled[anomaly_indices, 7].astype(int),
-            'NDI_p': predicted[anomaly_indices, 7].astype(int),
-            'threshold': threshold,
-            'anomaly_score': anomaly_scores[anomaly_indices],  # Add anomaly scores,
-            'distance_from_threshold': (anomaly_scores[anomaly_indices] - threshold)
-        })
-        
-        # Sort by anomaly score in descending order
-        anomalies = anomalies.sort_values('anomaly_score', ascending=False)
-        anomalies.to_csv(output_csv, index=False)
-
-    logging.info(f"Anomalies saved to CSV => {output_csv}")
-
-def count_trainable_parameters(model):
-    """Count the number of trainable parameters in the model"""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if n_components == 3:
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        sc = ax.scatter(latent_pca[:, 0], latent_pca[:, 1], latent_pca[:, 2],
+                        c=latent_pca[:, 0], cmap='viridis', s=3)
+        ax.set_title("Latent Space PCA (3 Components)")
+        ax.set_xlabel(f"PC1 ({explained_variance[0]*100:.1f}% var)")
+        ax.set_ylabel(f"PC2 ({explained_variance[1]*100:.1f}% var)")
+        ax.set_zlabel(f"PC3 ({explained_variance[2]*100:.1f}% var)")
+    elif n_components == 2:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sc = ax.scatter(latent_pca[:, 0], latent_pca[:, 1],
+                        c=latent_pca[:, 0], cmap='viridis', s=3)
+        ax.set_title("Latent Space PCA (2 Components)")
+        ax.set_xlabel(f"PC1 ({explained_variance[0]*100:.1f}% var)")
+        ax.set_ylabel(f"PC2 ({explained_variance[1]*100:.1f}% var)")
+        plt.colorbar(sc, ax=ax)
+    else:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.scatter(np.arange(latent_pca.shape[0]), latent_pca[:, 0], c='blue', s=3)
+        ax.set_xlabel("Sample index")
+        ax.set_ylabel(f"PC1 ({explained_variance[0]*100:.1f}% var)")
+        ax.set_title("Latent Space PCA (1 Component)")
     
-def calculate_threshold_evt(scores, q=0.99, p=95):
-    # Fit generalized Pareto distribution
-    tail_scores = scores[scores > np.percentile(scores, p)]
-    shape, loc, scale = stats.genpareto.fit(tail_scores)
+    plt.savefig(os.path.join(params['output_dir'], 'latent_space_plots.png'))
+    plt.close()
+    logging.info("Saved latent space plots (PCA).")
+
+
+def log_model_size(model: torch.nn.Module, device: torch.device = None) -> None:
+    """
+    Logs the model's parameter counts and estimated memory footprint.
+
+    Args:
+        model (torch.nn.Module): The model to analyze.
+        device (torch.device, optional): If provided, moves the model to this device.
+    """
+    if device is not None:
+        model.to(device)
     
-    # Calculate threshold using inverse CDF
-    threshold = stats.genpareto.ppf(q, shape, loc, scale)
-    return threshold
+    # Calculate parameter counts
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
 
-def bring_approach(args):
-    if args.approach == 'subAdjacent':
-        from approaches.subAdjacent.trainer import train_model, detect_anomalies, detect_anomalies_from_threshold
-        from approaches.subAdjacent.configClass import Config
-        train_func = train_model
-        detect_func = detect_anomalies_from_threshold
-        config = Config()
+    # Log parameter counts (using appropriate units)
+    if total_params >= 1e6:
+        logging.info(
+            f"Model parameters: Total: {total_params/1e6:.2f}M, "
+            f"Trainable: {trainable_params/1e6:.2f}M, "
+            f"Non-trainable: {non_trainable_params/1e6:.2f}M"
+        )
+    else:
+        logging.info(
+            f"Model parameters: Total: {total_params/1e3:.2f}K, "
+            f"Trainable: {trainable_params/1e3:.2f}K, "
+            f"Non-trainable: {non_trainable_params/1e3:.2f}K"
+        )
 
-    elif args.approach == 'subAdjacentLSTM':
-        from approaches.subAdjacentLSTM.trainer import train_model, detect_anomalies
-        from approaches.subAdjacentLSTM.configClass import Config
-        train_func = train_model
-        detect_func = detect_anomalies
-        config = Config()
-
-    elif args.approach == 'subAdjacentEmbed':
-        from approaches.subAdjacentEmbed.trainer import train_model, detect_and_categorical_anomalies
-        from approaches.subAdjacentEmbed.configClass import Config
-        train_func = train_model
-        detect_func = detect_and_categorical_anomalies
-        config = Config()
-
-    elif args.approach == 'surpriseTransformer':
-        from approaches.surpriseTransformer.trainer import train_function, detect_function
-        from approaches.surpriseTransformer.configClass import Config
-        train_func = train_function
-        detect_func = detect_function
-        config = Config()
-
-    elif args.approach == 'sslgad':
-        from approaches.sslgad.trainer import train_sslgad, detect_sslgad
-        from approaches.sslgad.configClass import Config
-        train_func = train_sslgad
-        detect_func = detect_sslgad
-        config = Config()
-
-    elif args.approach == 'tranad':
-        from approaches.tranAD.trainer import train_tranad, detect_tranad
-        from approaches.tranAD.configClass import Config
-        train_func = train_tranad
-        detect_func = detect_tranad
-        config = Config()    
-
-    return config, train_func, detect_func
+    # Estimate memory footprint
+    # Assuming each parameter is a 32-bit float (4 bytes)
+    bytes_per_param = 4
+    total_bytes = total_params * bytes_per_param
+    size_mb = total_bytes / (1024**2)
+    logging.info(f"Approximate model size: {size_mb:.2f} MB (assuming fp32)")
