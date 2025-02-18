@@ -8,7 +8,7 @@ from dataset import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
 
 import logging
-from utils import save_checkpoint, start_logging, validate_csv, compute_features_statistics, log_model_size
+from utils import save_checkpoint, start_logging, validate_csv, compute_features_statistics, log_model_size, EPS
 from model import NumericalAutoencoder
 
 def train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances):
@@ -22,14 +22,18 @@ def train_anomaly_detector(model, train_loader, optimizer, device, params, means
             for batch in train_loader:
                 optimizer.zero_grad()
                 features = batch['features'].to(device)  # [B, T, num_features]
-                outputs = model(features)
-                batch_loss = 0.0
-                # Compute MSE loss for each feature head.
-                for i in range(model.num_features):
-                    pred = outputs[i]  # [B, T, 1]
-                    target = features[:,:,i:i+1]  # [B, T, 1]
-                    loss_i = F.mse_loss(pred, target, reduction='mean')
-                    batch_loss += loss_i
+                outputs = model(features)  # [B, T, num_features]
+                
+                outputs = torch.cat(outputs, dim=-1)  # Now outputs has shape [B, T, num_features]
+                loss = F.mse_loss(outputs, features, reduction='none')  # [B, T, num_features]]
+                # Create per-feature weight vector based on inverse variance.
+                weights = torch.tensor(
+                    [1.0 / (variances[i].item() + EPS) for i in range(model.num_features)],
+                    device=device
+                )  # Shape: [num_features]
+                weighted_loss = loss * weights  # Broadcasting over B and T.
+                batch_loss = weighted_loss.mean()
+                
                 batch_loss.backward()
                 optimizer.step()
                 epoch_loss += batch_loss.item()
@@ -58,18 +62,17 @@ def main_training_pipeline(params, model):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    # Create the training dataset. Note that the dataset now will skip anomalous sequences
-    # and perform normalization (using the provided statistics).
+    # Create the training dataset (now including subtle anomalies).
     train_dataset = ParquetSequenceDataset(
         parquet_path=params['parquet_path'],
         feature_columns=params['feature_columns'],
         seq_len=params['seq_len'],
         stride=params['stride'],
         split='train',
-        validation_ratio=params['validation_ratio'],
+        validation_ratio=params['train_ratio'],
         seed=params['seed'],
-        skip_anomalies=params['skip_anomalies'],
-        normalization_stats=None  # Initially, we load raw data for computing stats.
+        skip_anomalies=params['skip_anomalies'],  # Should be False to include subtle anomalies.
+        normalization_stats=None  # Initially load raw data for computing stats.
     )
     train_loader = DataLoader(
         train_dataset,
@@ -78,11 +81,11 @@ def main_training_pipeline(params, model):
         collate_fn=custom_collate_fn,
     )
 
-    # Compute features statistics from the raw training data.
+    # Compute feature statistics from the raw training data.
     num_features = len(params['feature_columns'])
     means, variances = compute_features_statistics(train_loader, params, num_features)
     
-    # Now, reinitialize the dataset with normalization enabled.
+    # Reinitialize the dataset with normalization enabled.
     train_dataset.normalization_stats = {'means': means, 'variances': variances}
     
     log_model_size(model, device)
@@ -101,17 +104,18 @@ if __name__ == '__main__':
         'feature_columns': ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
         'seq_len': 20,
         'stride': 10,
-        'validation_ratio': 0.0,
+        'train_ratio': 0.95,
+        'val_ratio': 0.95,
         'seed': 42,
         'batch_size': 64,
         'num_epochs': 3,
         'lr': 5e-4,
-        'hidden_dim': 128,
+        'hidden_dim': 64,  # Reduced to enforce a stronger bottleneck.
         'percentile': 95,
         'dropout': 0.5,
         'pca_n_components': 2,
         'features_stats_json': 'features_stats.json',
-        'skip_anomalies': True
+        'skip_anomalies': False  # Include subtle anomalies during training.
     }
 
     start_logging(params)
