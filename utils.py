@@ -114,14 +114,15 @@ def compute_anomaly_scores(model, batch, means, variances, ignore_indices={0, 1,
     features = batch['features'].to(next(model.parameters()).device)  # [B, T, num_features]
     outputs = model(features)  # List of outputs; each: [B, T, 1]
     batch_size, seq_len, num_features = features.shape
-    
+
     scores = torch.zeros(batch_size, seq_len, device=features.device)
     per_feature_errors = torch.zeros(batch_size, seq_len, num_features, device=features.device)
-    
+
     # Compute variance for normalization (with EPS to avoid division by zero)
-    var = variances.to(features.device) + EPS  # shape: [num_features]
+    variances = torch.sqrt(variances + EPS)
+    var = variances.to(features.device)   # shape: [num_features]
     feature_weights = torch.tensor([1.0, 1.0, 1.0, 0.5, 1.5, 1.5, 1.0], device=features.device)
-    
+
     for i in range(num_features):
         if i not in ignore_indices:
             target = features[:, :, i:i+1]
@@ -130,12 +131,14 @@ def compute_anomaly_scores(model, batch, means, variances, ignore_indices={0, 1,
             error = feature_weights[i] * ((pred - target) ** 2) / var[i]
             scores += error.squeeze(-1)
             per_feature_errors[:, :, i] = error.squeeze(-1)
-    
+
     return scores, per_feature_errors
 
-def produce_anomalies_per_feature(model, val_loader, params, means, variances, ignore_indices={0, 1, 2}):
+
+def produce_anomalies_per_instance(model, val_loader, params, means, variances, ignore_indices={0, 1, 2}):
     """
-    Optimized version that uses compute_anomaly_scores and calculates per-feature thresholds correctly.
+    Computes anomaly scores per instance (time step) and then selects the top 9k anomaly instances,
+    sorted by anomaly score in descending order.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -144,86 +147,80 @@ def produce_anomalies_per_feature(model, val_loader, params, means, variances, i
     all_timestamps = []
     all_true_features = []
     all_pred_features = []
-    all_feature_errors = []
-    all_per_feature_errors = []
-    
+    all_instance_errors = []  # overall anomaly scores for each time step
+    all_per_feature_errors = []  # keeping per-feature errors for reference
+
     with torch.no_grad():
         with tqdm(total=len(val_loader), desc="Computing anomalies", unit="batch") as val_bar:
             for batch in val_loader:
                 features = batch['features'].to(device)
-                
+
                 # Compute anomaly scores and per-feature errors
                 scores, per_feature_errors = compute_anomaly_scores(model, batch, means, variances, ignore_indices)
-                
+
                 # Get model predictions for all features at once
                 outputs = model(features)
                 pred_tensor = torch.cat(outputs, dim=-1)
-                
+
                 # Unnormalize features (do this on GPU)
                 unnorm_pred = unnormalize_features(pred_tensor, means.to(device), variances.to(device))
                 unnorm_true = unnormalize_features(features, means.to(device), variances.to(device))
-                
+
                 # Store results
+                # Assume each batch['timestamps'] is a list/iterable of timestamps for that batch (e.g. per sample)
                 all_timestamps.extend(batch['timestamps'])
                 all_true_features.append(unnorm_true.cpu())
                 all_pred_features.append(unnorm_pred.cpu())
-                all_feature_errors.append(scores.cpu())
+                all_instance_errors.append(scores.cpu())
                 all_per_feature_errors.append(per_feature_errors.cpu())
-                
+
                 val_bar.update(1)
-    
-    # Concatenate all results
-    all_true_features = torch.cat(all_true_features, dim=0)
+
+    # Concatenate results from all batches
+    all_true_features = torch.cat(all_true_features, dim=0)  # shape: (num_samples, T, num_features)
     all_pred_features = torch.cat(all_pred_features, dim=0)
-    all_feature_errors = torch.cat(all_feature_errors, dim=0)
+    all_instance_errors = torch.cat(all_instance_errors, dim=0)  # shape: (num_samples, T)
     all_per_feature_errors = torch.cat(all_per_feature_errors, dim=0)
-    
-    # Calculate per-feature thresholds
-    feature_names = [name for i, name in enumerate(params['feature_columns']) 
-                    if i not in ignore_indices]
-    thresholds = {}
-    
-    # Convert to numpy for percentile calculation
-    per_feature_errors_np = all_per_feature_errors.numpy()
-    
-    # Calculate threshold for each feature separately
-    for i, feature_name in enumerate(params['feature_columns']):
-        if i not in ignore_indices:
-            feature_errors = per_feature_errors_np[:, :, i].flatten()
-            thresholds[feature_name] = np.percentile(feature_errors, params['percentile'])
-    
-    # Create anomalies DataFrame
+
+    # Get dimensions (num_samples x time_steps)
+    num_samples, T = all_instance_errors.shape
+    total_instances = num_samples * T
+
+    # Flatten tensors so that each row corresponds to one time step instance
+    instance_errors_flat = all_instance_errors.view(-1)  # shape: (total_instances,)
+    true_features_flat = all_true_features.view(total_instances, all_true_features.shape[-1])
+    pred_features_flat = all_pred_features.view(total_instances, all_pred_features.shape[-1])
+    per_feature_errors_flat = all_per_feature_errors.view(total_instances, all_per_feature_errors.shape[-1])
+
+    # Flatten the timestamps.
+    # Assume each element in all_timestamps is an iterable (e.g. list) of timestamps per sample.
+    timestamps_flat = [ts for ts_list in all_timestamps for ts in ts_list]
+
+    # Get indices that would sort the anomaly scores in descending order.
+    sorted_indices = torch.argsort(instance_errors_flat, descending=True)
+    top_n = min(18000, total_instances)
+    top_indices = sorted_indices[:top_n]
+
+    # Build anomalies list using the top indices
     anomalies = []
-    for idx in range(len(all_timestamps)):
-        for t in range(all_true_features.shape[1]):
-            feature_errors = {
-                feature_name: all_per_feature_errors[idx, t, i].item()
-                for i, feature_name in enumerate(params['feature_columns'])
-                if i not in ignore_indices
-            }
-            
-            # Check if any feature exceeds its threshold
-            reasons = [name for name, error in feature_errors.items() 
-                      if error > thresholds[name]]
-            
-            if reasons:
-                anomaly = {
-                    'timestamp': str(all_timestamps[idx][t]),
-                    'true_features': all_true_features[idx, t].tolist(),
-                    'predicted_features': all_pred_features[idx, t].tolist(),
-                    'anomaly_score': all_feature_errors[idx, t].item(),
-                    'feature_errors': feature_errors,
-                    'anomaly_reason': ",".join(reasons)
-                }
-                anomalies.append(anomaly)
-    
-    # Create and sort DataFrame
+    for idx in top_indices.tolist():
+        anomaly = {
+            'timestamp': str(timestamps_flat[idx]),
+            'true_features': true_features_flat[idx].tolist(),
+            'predicted_features': pred_features_flat[idx].tolist(),
+            'anomaly_score': instance_errors_flat[idx].item(),
+            'per_feature_errors': per_feature_errors_flat[idx].tolist()
+        }
+        anomalies.append(anomaly)
+
+    # Create DataFrame and drop duplicate timestamps if needed
     anomalies_df = pd.DataFrame(anomalies)
     if not anomalies_df.empty:
-        anomalies_df = anomalies_df.sort_values(by='anomaly_score', ascending=False)
         anomalies_df = anomalies_df.drop_duplicates(subset='timestamp')
-    
-    return anomalies_df, thresholds
+
+    return anomalies_df
+
+
 
 
 
@@ -252,8 +249,7 @@ def validate_csv(model, params, means, variances):
     val_loader = DataLoader(val_dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=custom_collate_fn)
 
     # Compute anomalies using the existing procedure.
-    anomalies_df, thresholds = produce_anomalies_per_feature(model, val_loader, params, means, variances)
-    logging.info(f"Per-feature thresholds: {thresholds}")
+    anomalies_df = produce_anomalies_per_instance(model, val_loader, params, means, variances)
     if anomalies_df.empty:
         logging.warning("No anomalies detected during validation!")
         return 0.0, 0.0, 0.0

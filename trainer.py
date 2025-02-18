@@ -99,13 +99,13 @@ if __name__ == '__main__':
     # Hyperparameters and settings.
     params = {
         'parquet_path': 'unscaled_pdsch.parquet',
-        'validation_parquet_path': 'unscaled_pdsch_val.parquet', 
+        'validation_parquet_path': 'unscaled_pdsch_val_min.parquet', 
         'output_dir': './output',
         'feature_columns': ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
         'seq_len': 20,
         'stride': 10,
         'train_ratio': 0.95,
-        'val_ratio': 0.95,
+        'val_ratio': 0.0,
         'seed': 42,
         'batch_size': 64,
         'num_epochs': 3,
