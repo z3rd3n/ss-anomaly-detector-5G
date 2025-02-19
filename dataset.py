@@ -1,3 +1,4 @@
+# dataset.py
 import os
 import logging
 from pathlib import Path
@@ -8,42 +9,40 @@ from torch.utils.data import IterableDataset, Dataset
 
 
 EPS = 1e-6
-MAX_RETX = 5
+MAX_RETX = 4
 
 def rule_based_flags(sequence: torch.Tensor) -> torch.Tensor:
     """
-    Apply rule-based checks to flag anomalous timesteps in the sequence.
-    Returns a boolean tensor (shape [seq_len]) with True indicating a rule violation.
+    Use a Pandas DataFrame and groupby to flag anomalous timesteps in the sequence.
+    The rules applied (to match method 2) are:
+      - Unnecessary ReTx: If ReTx > 0 and the previous CRC was 1.
+      - Missing ReTx: If ReTx == 0 and the previous CRC was 0.
+      - New Data but No ReTx: If the previous CRC is 0 and the current NDI is different from the previous NDI.
+      - Max ReTx Achieved: If ReTx equals (MAX_RETX + 1).
     
-    The following rules are applied:
-      - "Unnecessary ReTx": If ReTx > 0 and the previous CRC was 1.
-      - "Missing ReTx": If ReTx == 0 and the previous CRC was 0 and the current NDI equals the previous NDI.
-      - "New Data but No ReTx": If the previous CRC is 0 and the current NDI is different from the previous NDI.
-      - "Max ReTx Achieved": If ReTx >= MAX_RETX.
+    Assumes the sequence tensor has shape (seq_len, 7) with columns:
+      ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]
     """
-    seq = sequence.cpu().numpy()  # shape (seq_len, 7)
-    seq_len = seq.shape[0]
-    flags = np.zeros(seq_len, dtype=bool)
-    for t in range(seq_len):
-        current_harq = seq[t, 2]
-        t_prev = None
-        for candidate in range(t - 1, -1, -1):
-            if seq[candidate, 2] == current_harq:
-                t_prev = candidate
-                break
-        if t_prev is None:
-            continue
-        prev_crc = seq[t_prev, 4]
-        curr_crc = seq[t, 4]
-        curr_ret = seq[t, 5]
-        curr_ndi = seq[t, 6]
-        prev_ndi = seq[t_prev, 6]
-        if (curr_ret > 0 and prev_crc == 1) or \
-           (curr_ret == 0 and prev_crc == 0 and (curr_ndi == prev_ndi)) or \
-           (prev_crc == 0 and (curr_ndi != prev_ndi)) or \
-           (curr_ret >= MAX_RETX):
-            flags[t] = True
-    return torch.tensor(flags, dtype=torch.bool)
+    # Convert tensor to numpy array and create DataFrame
+    arr = sequence.cpu().numpy()
+    columns = ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]
+    df = pd.DataFrame(arr, columns=columns)
+    
+    # Use groupby to simulate SQL's LAG function.
+    df['prev_crc'] = df.groupby('HARQ')['CRC'].shift(1)
+    df['prev_ndi'] = df.groupby('HARQ')['NDI'].shift(1)
+    
+    # Compute anomaly flags per the specified rules:
+    flag_unnecessary_retx = (df['ReTx'] > 0) & (df['prev_crc'] == 1)
+    flag_missing_retx     = (df['ReTx'] == 0) & (df['prev_crc'] == 0)
+    flag_new_data_no_retx = (df['prev_crc'] == 0) & (df['NDI'] != df['prev_ndi'])
+    flag_max_retx         = (df['ReTx'] == (MAX_RETX))
+    
+    # Combine all conditions to create the final flag.
+    flags = flag_unnecessary_retx | flag_missing_retx | flag_new_data_no_retx | flag_max_retx
+    
+    # Convert flags back to a Torch tensor and return.
+    return torch.tensor(flags.values, dtype=torch.bool)
 
 
 class ParquetSequenceDataset(IterableDataset):
@@ -176,52 +175,6 @@ class ParquetSequenceDataset(IterableDataset):
 
     def __len__(self):
         return self._length
-
-class CSVValidationDataset(Dataset):
-    def __init__(self, csv_path, seq_len=32, stride=16, normalization_stats: dict = None):
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file not found: {csv_path}")
-        self.df = pd.read_csv(csv_path)
-        self.seq_len = seq_len
-        self.stride = stride
-        required_columns = ["timestamp_str", "SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]
-        for col in required_columns:
-            if col not in self.df.columns:
-                raise ValueError(f"Column '{col}' is missing from {csv_path}!")
-        self.raw_features = self.df[["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]].values.astype(np.int64)
-        self.timestamps = self.df["timestamp_str"].tolist()
-        self.normalization_stats = normalization_stats
-        total = len(self.raw_features)
-        self.num_sequences = max(0, (total - self.seq_len) // self.stride + 1)
-
-    def _normalize(self, features: torch.Tensor):
-        if self.normalization_stats is None:
-            return features
-        if isinstance(self.normalization_stats['means'], torch.Tensor):
-            means = self.normalization_stats['means'].clone().detach().to(dtype=torch.float32, device=features.device)
-        else:
-            means = torch.tensor(self.normalization_stats['means'], dtype=torch.float32, device=features.device).clone().detach()
-
-        if isinstance(self.normalization_stats['variances'], torch.Tensor):
-            variances = self.normalization_stats['variances'].clone().detach().to(dtype=torch.float32, device=features.device)
-        else:
-            variances = torch.tensor(self.normalization_stats['variances'], dtype=torch.float32, device=features.device).clone().detach()
-
-        std = torch.sqrt(variances + EPS)
-        features_norm = (features.float() - means) / std
-        return features_norm
-
-    def __len__(self):
-        return self.num_sequences
-
-    def __getitem__(self, idx):
-        start_idx = idx * self.stride
-        end_idx = start_idx + self.seq_len
-        if end_idx > len(self.raw_features):
-            end_idx = len(self.raw_features)
-            start_idx = end_idx - self.seq_len
-        seq = torch.tensor(self.raw_features[start_idx:end_idx], dtype=torch.long)
-        return {'features': self._normalize(seq), 'timestamps': self.timestamps[start_idx:end_idx]}
 
 def custom_collate_fn(batch):
     try:

@@ -1,3 +1,4 @@
+#utils.py
 import os
 import logging
 from datetime import datetime
@@ -192,7 +193,6 @@ def produce_anomalies_per_instance(model, val_loader, params, means, variances, 
     pred_features_flat = all_pred_features.view(total_instances, all_pred_features.shape[-1])
     per_feature_errors_flat = all_per_feature_errors.view(total_instances, all_per_feature_errors.shape[-1])
 
-    # Flatten the timestamps.
     # Assume each element in all_timestamps is an iterable (e.g. list) of timestamps per sample.
     timestamps_flat = [ts for ts_list in all_timestamps for ts in ts_list]
 
@@ -219,9 +219,6 @@ def produce_anomalies_per_instance(model, val_loader, params, means, variances, 
         anomalies_df = anomalies_df.drop_duplicates(subset='timestamp')
 
     return anomalies_df
-
-
-
 
 
 def validate_csv(model, params, means, variances):

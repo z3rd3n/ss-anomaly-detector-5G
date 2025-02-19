@@ -1,3 +1,4 @@
+#trainer.py
 import os
 import numpy as np
 import pandas as pd
@@ -115,7 +116,7 @@ if __name__ == '__main__':
         'dropout': 0.5,
         'pca_n_components': 2,
         'features_stats_json': 'features_stats.json',
-        'skip_anomalies': False  # Include subtle anomalies during training.
+        'skip_anomalies': True  # Include subtle anomalies during training.
     }
 
     start_logging(params)
