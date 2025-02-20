@@ -1,4 +1,3 @@
-#trainer.py
 import os
 import numpy as np
 import pandas as pd
@@ -9,36 +8,49 @@ from dataset import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
 
 import logging
-from utils import save_checkpoint, start_logging, validate_csv, compute_features_statistics, log_model_size, EPS
+from utils import (save_checkpoint, start_logging, validate_csv, 
+                   compute_features_statistics, log_model_size, EPS,
+                   center_margin_loss)
 from model import NumericalAutoencoder
 
 def train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances):
     num_epochs = params.get('num_epochs', 10)
     best_f1 = 0.0
-    
+    contrast_lambda = params.get('contrast_lambda', 1.0)  # weight for contrastive loss
+
     for epoch in range(1, num_epochs + 1):
         model.train()
         epoch_loss = 0.0
         with tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{num_epochs}", unit="batch") as pbar:
             for batch in train_loader:
                 optimizer.zero_grad()
-                features = batch['features'].to(device)  # [B, T, num_features]
-                outputs = model(features)  # [B, T, num_features]
+                # features shape: [B, T, num_features]
+                features = batch['features'].to(device)
+                # rule_flags: [B, T] (bool tensor indicating rule-based anomaly at each timestamp)
+                rule_flags = batch['rule_flags'].to(device)
                 
-                outputs = torch.cat(outputs, dim=-1)  # Now outputs has shape [B, T, num_features]
-                loss = F.mse_loss(outputs, features, reduction='none')  # [B, T, num_features]]
-                # Create per-feature weight vector based on inverse variance.
+                # Forward pass with latent extraction.
+                outputs, proj_latents = model(features, return_latents=True)
+                # Concatenate outputs along feature dim to get shape [B, T, num_features]
+                outputs_concat = torch.cat(outputs, dim=-1)
+                
+                # Reconstruction loss per feature (weighted by inverse variance)
+                loss = F.mse_loss(outputs_concat, features, reduction='none')  # [B, T, num_features]
                 weights = torch.tensor(
                     [1.0 / (variances[i].item() + EPS) for i in range(model.num_features)],
                     device=device
-                )  # Shape: [num_features]
-                weighted_loss = loss * weights  # Broadcasting over B and T.
-                batch_loss = weighted_loss.mean()
+                )  # shape: [num_features]
+                weighted_loss = loss * weights  # broadcasting over B and T
+                rec_loss = weighted_loss.mean()
                 
-                batch_loss.backward()
+                # Compute contrastive (center margin) loss on the projected latents.
+                contrast_loss = center_margin_loss(proj_latents, rule_flags, margin=params.get('contrast_margin', 1.0))
+                
+                total_loss = rec_loss + contrast_lambda * contrast_loss
+                total_loss.backward()
                 optimizer.step()
-                epoch_loss += batch_loss.item()
-                pbar.set_postfix(loss=f"{batch_loss.item():.4f}")
+                epoch_loss += total_loss.item()
+                pbar.set_postfix(loss=f"{total_loss.item():.4f}", rec_loss=f"{rec_loss.item():.4f}", contrast_loss=f"{contrast_lambda * contrast_loss.item():.4f}")
                 pbar.update(1)
         avg_loss = epoch_loss / len(train_loader)
         logging.info(f"Epoch {epoch}/{num_epochs}: Average Loss = {avg_loss:.4f}")
@@ -69,10 +81,9 @@ def main_training_pipeline(params, model):
         feature_columns=params['feature_columns'],
         seq_len=params['seq_len'],
         stride=params['stride'],
-        split='train',
-        validation_ratio=params['train_ratio'],
+        ratio=params['train_ratio'],
         seed=params['seed'],
-        skip_anomalies=params['skip_anomalies'],  # Should be False to include subtle anomalies.
+        skip_anomalies=False,  # Include subtle anomalies during training.
         normalization_stats=None  # Initially load raw data for computing stats.
     )
     train_loader = DataLoader(
@@ -105,18 +116,21 @@ if __name__ == '__main__':
         'feature_columns': ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
         'seq_len': 20,
         'stride': 10,
-        'train_ratio': 0.95,
-        'val_ratio': 0.0,
+        'train_ratio': 0.1,
+        'val_ratio': 1.0,
         'seed': 42,
         'batch_size': 64,
         'num_epochs': 3,
         'lr': 5e-4,
-        'hidden_dim': 64,  # Reduced to enforce a stronger bottleneck.
+        'hidden_dim': 128,  # Reduced to enforce a stronger bottleneck.
         'percentile': 95,
         'dropout': 0.5,
         'pca_n_components': 2,
         'features_stats_json': 'features_stats.json',
-        'skip_anomalies': True  # Include subtle anomalies during training.
+        'skip_anomalies': False,  # Do not skip rule-based anomalies
+        'contrast_lambda': 1.0,   # Weight for contrastive loss term
+        'contrast_margin': 2.0,   # Margin for the contrastive loss
+        'contrast_beta': 0.5,     # Weight for adding contrastive anomaly score at inference
     }
 
     start_logging(params)
