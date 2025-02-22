@@ -8,8 +8,8 @@ class Model(nn.Module):
         A CNN+Self-Attention autoencoder for numerical features that includes:
          - Reconstruction via per-feature output heads.
          - A latent space from the encoder.
-         - A classification head that outputs 5 classes:
-             4 for rule–based anomalies,
+         - A classification head that outputs 7 classes:
+             6 for rule–based anomalies,
              1 for not anomaly (normal),
         """
         super().__init__()

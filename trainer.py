@@ -17,48 +17,61 @@ from utils import (save_checkpoint, start_logging, validate_csv,
 from model import Model
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None, reduction='mean', ignore_normal=True):
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
+        """
+        Args:
+            gamma: Focusing parameter.
+            alpha: Tensor of shape [num_classes] with per-class weights.
+                   For your case, set alpha[0] = 0 (or a very small number) 
+                   and alpha for anomalies based on inverse frequency.
+            reduction: 'mean', 'sum', or 'none'.
+        """
         super(FocalLoss, self).__init__()
         self.gamma = gamma
-        self.weight = weight  # Tensor of shape [num_classes]
+        self.alpha = alpha  # if None, defaults to 1 for all classes
         self.reduction = reduction
-        self.ignore_normal = ignore_normal  # if True, ignore loss for class 0
 
     def forward(self, inputs, targets):
-        # Compute cross entropy loss per sample.
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        # Calculate the log probabilities.
+        logpt = -F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(logpt)
 
-        if self.ignore_normal:
-            # Create a mask that is 0 for normal instances (label 0) and 1 otherwise.
-            mask = (targets != 0).float()
-            focal_loss = focal_loss * mask
-            if self.reduction == 'mean':
-                # Average only over non-normal instances (avoid dividing by 0)
-                return focal_loss.sum() / (mask.sum() + 1e-8)
-            elif self.reduction == 'sum':
-                return focal_loss.sum()
-            else:
-                return focal_loss
+        # Get the alpha for each sample: if alpha is provided, index it by targets.
+        if self.alpha is not None:
+            at = self.alpha[targets]
         else:
-            if self.reduction == 'mean':
-                return focal_loss.mean()
-            elif self.reduction == 'sum':
-                return focal_loss.sum()
-            else:
-                return focal_loss
+            at = 1.0
+
+        loss = -at * ((1 - pt) ** self.gamma) * logpt
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
 
 
 def train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances):
     num_epochs = params.get('num_epochs', 10)
     best_val_class_acc = 0.0
 
-    
-    num_classes = 5
-    # Example class weights – adjust these if needed.
-    weights = torch.tensor([0.02, 0.25, 0.35, 0.20, 0.18])
-    focal_loss_fn = FocalLoss(gamma=2.0, weight=weights.to(device), reduction='mean')
+    counts_dataset = train_loader.dataset.counts
+    counts = torch.tensor([counts_dataset[i] for i in range(len(counts_dataset))], dtype=torch.float)
+    logging.info(f"Class counts: {counts.tolist()}")
+
+    # Compute inverse frequencies (add a small epsilon if needed).
+    inv_freq = 1.0 / (counts.float() + 1e-8)
+
+    # Normalize the weights so they sum to 1 (or scale them appropriately).
+    alpha = inv_freq / inv_freq.sum()
+
+    # Move alpha to the device.
+    alpha = alpha.to(device)
+
+    # Then initialize your loss:
+    focal_loss_fn = FocalLoss(gamma=2.0, alpha=alpha, reduction='mean')
+
     
     mse_loss_fn = nn.MSELoss()
 
@@ -68,8 +81,6 @@ def train_anomaly_detector(model, train_loader, optimizer, device, params, means
         total_batches = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", unit="batch")
         for batch_idx, batch in enumerate(pbar):
-            if batch_idx >= 200:
-                break
             optimizer.zero_grad()
             features = batch['features'].to(device)    # shape: [B, T, num_features]
             true_labels = batch['labels'].to(device)     # shape: [B, T]
@@ -82,7 +93,7 @@ def train_anomaly_detector(model, train_loader, optimizer, device, params, means
             recon_loss = mse_loss_fn(recon, features)
             
             # Classification loss computed per time step.
-            clf_loss = focal_loss_fn(class_logits.view(-1, num_classes), true_labels.view(-1))
+            clf_loss = focal_loss_fn(class_logits.view(-1, len(counts)), true_labels.view(-1))
             
             # Total loss is the sum (you may weight each term as needed).
             total_loss = recon_loss + clf_loss
@@ -170,13 +181,13 @@ def main_training_pipeline(params, model, train=True):
 if __name__ == '__main__':
     # Hyperparameters and settings.
     params = {
-        'parquet_path': 'unscaled_pdsch.parquet',
+        'parquet_path': 'unscaled_pdsch_val.parquet',
         'validation_parquet_path': 'unscaled_pdsch_val_min.parquet', 
         'output_dir': './output',
         'feature_columns': ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
         'seq_len': 20,
-        'stride': 10,
-        'train_ratio': 0.001,
+        'stride': 5,
+        'train_ratio': 0.01, # less than 0.2, not enough class
         'val_ratio': 1.0,
         'seed': 42,
         'batch_size': 64,

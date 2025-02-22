@@ -165,8 +165,10 @@ def validate_csv(model, params, means, variances, device):
         class_accuracies[label.item()] = (correct, total, accuracy)
 
     # Log individual class accuracies.
+    anomaly_mapping = {v: k for k, v in val_loader.dataset.anomaly_mapping.items()}
     for label, (correct, total, accuracy) in class_accuracies.items():
-        logging.info(f"Class {label}: {correct}/{total} ({accuracy*100:.2f}%)")
+        class_name = anomaly_mapping.get(label, f"Class {label}")
+        logging.info(f"{class_name}: {correct}/{total} ({accuracy*100:.2f}%)")
 
     # Separate normal (label 0) and anomaly (labels != 0) samples.
     normal_mask = (all_true == 0)
@@ -183,6 +185,8 @@ def validate_csv(model, params, means, variances, device):
     logging.info(f"Normal Instances: {normal_correct}/{normal_total} ({normal_acc*100:.2f}%)")
     logging.info(f"Anomaly Instances: {anomaly_correct}/{anomaly_total} ({anomaly_acc*100:.2f}%)")
     logging.info(f"Balanced Accuracy: {balanced_acc*100:.2f}%")
+
+    plot_performance_metrics(all_true, all_pred, params)
 
     return balanced_acc
 
@@ -259,3 +263,64 @@ def log_model_size(model: torch.nn.Module, device: torch.device = None) -> None:
     total_bytes = total_params * bytes_per_param
     size_mb = total_bytes / (1024**2)
     logging.info(f"Approximate model size: {size_mb:.2f} MB (assuming fp32)")
+
+
+def plot_performance_metrics(all_true, all_pred, params):
+    """
+    Save performance plots (confusion matrix and detection ratio by class)
+    to the output directory.
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import confusion_matrix
+
+    class_names = {
+        0: "normal",
+        1: "unnecessary_retx",
+        2: "missing_retx",
+        3: "new_data_no_retx",
+        4: "max_retx_achieved"
+    }
+
+    # Compute the confusion matrix.
+    cm = confusion_matrix(all_true, all_pred)
+    plt.figure(figsize=(10, 8))
+    plt.imshow(cm, interpolation='nearest', cmap='Blues')
+    plt.title("Confusion Matrix")
+    plt.colorbar()
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, [class_names[i] for i in tick_marks], rotation=45)
+    plt.yticks(tick_marks, [class_names[i] for i in tick_marks])
+    plt.xlabel("Predicted Class")
+    plt.ylabel("True Class")
+
+    # Annotate the confusion matrix.
+    thresh = cm.max() / 2.
+    for i, j in np.ndindex(cm.shape):
+        plt.text(j, i, format(cm[i, j], 'd'),
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+
+    cm_path = os.path.join(params['output_dir'], 'confusion_matrix.png')
+    plt.savefig(cm_path)
+    plt.close()
+    logging.info(f"Confusion matrix saved to {cm_path}")
+
+    # Compute per-class detection accuracy.
+    classes = np.unique(all_true)
+    accuracies = []
+    for cls in classes:
+        mask = (all_true == cls)
+        acc = (all_true[mask] == all_pred[mask]).float().mean() if mask.sum() > 0 else 0
+        accuracies.append(acc)
+    plt.figure(figsize=(10, 6))
+    plt.bar([class_names[cls] for cls in classes], accuracies, color='skyblue')
+    plt.title("Detection Ratio by Class")
+    plt.xlabel("Class")
+    plt.ylabel("Accuracy")
+    plt.ylim(0, 1)
+    dr_path = os.path.join(params['output_dir'], 'detection_ratio_by_class.png')
+    plt.savefig(dr_path)
+    plt.close()
+    logging.info(f"Detection ratio by class plot saved to {dr_path}")
