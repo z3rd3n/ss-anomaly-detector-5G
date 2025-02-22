@@ -1,3 +1,4 @@
+# utils.py
 import os
 import logging
 from datetime import datetime
@@ -49,24 +50,15 @@ def load_checkpoint(filename: str, model: nn.Module, optimizer: torch.optim.Opti
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch = checkpoint.get('epoch', 0)
-        best_f1 = checkpoint.get('best_f1', 0.0)
+        best_f1 = checkpoint.get('best_val_class_acc', 0.0)
         params = checkpoint.get('params', {})
-        logging.info(f"Loaded checkpoint '{filename}' (epoch {epoch}) with best F1: {best_f1:.4f}")
+        logging.info(f"Loaded checkpoint '{filename}' (epoch {epoch}) with best validation accuracy: {best_f1:.4f}")
         return epoch, best_f1, params
     else:
         logging.warning(f"No checkpoint found at '{filename}'")
         return 0, 0.0, {}
 
 def compute_features_statistics(train_loader, params, num_features):
-    """
-    Computes per-feature mean and variance from the training data.
-    The computed statistics are saved to a JSON file specified in params['features_stats_json'].
-    If the JSON file exists, load and return the statistics.
-    
-    Returns:
-        means: torch.FloatTensor of shape [num_features]
-        variances: torch.FloatTensor of shape [num_features]
-    """
     stats_file = params['features_stats_json']
     if os.path.exists(stats_file):
         logging.info(f"Loading features statistics from {stats_file}")
@@ -81,7 +73,6 @@ def compute_features_statistics(train_loader, params, num_features):
     total_sum_sq = torch.zeros(num_features, dtype=torch.float64)
     count = 0
     for batch in tqdm(train_loader, desc="Computing features statistics", unit="batch"):
-        # features: [B, T, num_features]
         features = batch['features'].to(torch.float64)
         B, T, F = features.shape
         count += B * T
@@ -96,131 +87,33 @@ def compute_features_statistics(train_loader, params, num_features):
     return means, variances
 
 def unnormalize_features(normalized_tensor, means, variances):
-    """
-    Unnormalizes a tensor that was normalized using (x - mean)/sqrt(var+EPS).
-    Returns the unnormalized tensor cast to the nearest integer.
-    """
     std = torch.sqrt(variances + EPS)
     unnorm = normalized_tensor.float() * std + means
     return torch.clamp(torch.round(unnorm), min=0).to(torch.int64)
 
-def compute_anomaly_scores(model, batch, means, variances, params, ignore_indices={0, 1, 2}):
-    """
-    Given a batch (with key 'features') and the trained model,
-    returns a tensor of anomaly scores of shape [B, T] and per-feature errors.
-    Now, besides the weighted reconstruction error, we add a contrastive score computed
-    as the distance (per timestamp) of the projected latent from the (batch) normal center.
-    """
-    device = next(model.parameters()).device
-    features = batch['features'].to(device)  # [B, T, num_features]
-    
-    # Get both reconstruction outputs and projected latents.
-    outputs, proj_latents = model(features, return_latents=True)
-    batch_size, seq_len, num_features = features.shape
-
-    # Reconstruction error
-    scores_rec = torch.zeros(batch_size, seq_len, device=device)
-    per_feature_errors = torch.zeros(batch_size, seq_len, num_features, device=device)
-
-    # Compute variance for normalization (with EPS to avoid division by zero)
-    variances_sqrt = torch.sqrt(variances + EPS).to(device)
-    feature_weights = torch.tensor([1.0, 1.0, 1.0, 0.5, 1.5, 1.5, 1.0], device=device)
-
-    for i in range(num_features):
-        if i not in ignore_indices:
-            target = features[:, :, i:i+1]
-            pred = outputs[i]
-            error = feature_weights[i] * ((pred - target) ** 2) / variances_sqrt[i]
-            scores_rec += error.squeeze(-1)
-            per_feature_errors[:, :, i] = error.squeeze(-1)
-    
-    # Contrastive score: compute the (Euclidean) distance of each projected latent from the batch normal center.
-    # (Assuming anomalies are few, the mean over all timestamps approximates the normal center.)
-    center = proj_latents.mean(dim=(0,1), keepdim=True)  # shape: [1, 1, latent_dim]
-    contrast_scores = torch.sqrt(((proj_latents - center)**2).sum(dim=-1) + EPS)  # [B, T]
-    
-    # Weight the contrastive score and add to reconstruction score.
-    beta = params.get('contrast_beta', 0.5)
-    total_scores = scores_rec + beta * contrast_scores
-
-    return total_scores, per_feature_errors
-
-def produce_anomalies_per_instance(model, val_loader, params, means, variances, ignore_indices={0, 1, 2}):
-    """
-    Computes anomaly scores per instance (time step) and then selects the top anomaly instances.
-    """
+def produce_anomalies_per_instance(model, val_loader, device):
     model.eval()
-    device = next(model.parameters()).device
-
-    all_timestamps = []
-    all_true_features = []
-    all_pred_features = []
-    all_instance_errors = []
-    all_per_feature_errors = []
-
+    all_true_labels = []
+    all_pred_labels = []
+    
     with torch.no_grad():
         with tqdm(total=len(val_loader), desc="Computing anomalies", unit="batch") as val_bar:
             for batch in val_loader:
+                true_labels = batch['labels'].to(device)
                 features = batch['features'].to(device)
-
-                # Compute anomaly scores and per-feature errors.
-                scores, per_feature_errors = compute_anomaly_scores(model, batch, means, variances, params, ignore_indices)
-
-                outputs, _ = model(features, return_latents=True)
-                pred_tensor = torch.cat(outputs, dim=-1)
-
-                unnorm_pred = unnormalize_features(pred_tensor, means.to(device), variances.to(device))
-                unnorm_true = unnormalize_features(features, means.to(device), variances.to(device))
-
-                all_timestamps.extend(batch['timestamps'])
-                all_true_features.append(unnorm_true.cpu())
-                all_pred_features.append(unnorm_pred.cpu())
-                all_instance_errors.append(scores.cpu())
-                all_per_feature_errors.append(per_feature_errors.cpu())
-
+                _, class_logits = model(features)
+                all_true_labels.append(true_labels.cpu())
+                pred_labels = torch.argmax(class_logits, dim=-1)
+                all_pred_labels.append(pred_labels.cpu())
                 val_bar.update(1)
+    
+    all_true_labels = torch.cat(all_true_labels, dim=0)
+    all_pred_labels = torch.cat(all_pred_labels, dim=0)
+    true_labels_flat = all_true_labels.view(-1)
+    pred_labels_flat = all_pred_labels.view(-1)
+    return true_labels_flat, pred_labels_flat
 
-    all_true_features = torch.cat(all_true_features, dim=0)
-    all_pred_features = torch.cat(all_pred_features, dim=0)
-    all_instance_errors = torch.cat(all_instance_errors, dim=0)
-    all_per_feature_errors = torch.cat(all_per_feature_errors, dim=0)
-
-    num_samples, T = all_instance_errors.shape
-    total_instances = num_samples * T
-
-    instance_errors_flat = all_instance_errors.view(-1)
-    true_features_flat = all_true_features.view(total_instances, all_true_features.shape[-1])
-    pred_features_flat = all_pred_features.view(total_instances, all_pred_features.shape[-1])
-    per_feature_errors_flat = all_per_feature_errors.view(total_instances, all_per_feature_errors.shape[-1])
-
-    timestamps_flat = [ts for ts_list in all_timestamps for ts in ts_list]
-
-    sorted_indices = torch.argsort(instance_errors_flat, descending=True)
-    top_n = min(18000, total_instances)
-    top_indices = sorted_indices[:top_n]
-
-    anomalies = []
-    for idx in top_indices.tolist():
-        anomaly = {
-            'timestamp': str(timestamps_flat[idx]),
-            'true_features': true_features_flat[idx].tolist(),
-            'predicted_features': pred_features_flat[idx].tolist(),
-            'anomaly_score': instance_errors_flat[idx].item(),
-            'per_feature_errors': per_feature_errors_flat[idx].tolist()
-        }
-        anomalies.append(anomaly)
-
-    anomalies_df = pd.DataFrame(anomalies)
-    if not anomalies_df.empty:
-        anomalies_df = anomalies_df.drop_duplicates(subset='timestamp')
-
-    return anomalies_df
-
-def validate_csv(model, params, means, variances):
-    """
-    Validates the model on validation data (from a parquet file) by computing anomaly scores
-    and comparing against ground truth extracted from the parquet.
-    """
+def validate_csv(model, params, means, variances, device):
     logging.info("Starting Parquet validation procedure...")
 
     val_dataset = ParquetSequenceDataset(
@@ -235,95 +128,65 @@ def validate_csv(model, params, means, variances):
     )
     val_loader = DataLoader(val_dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=custom_collate_fn)
 
-    anomalies_df = produce_anomalies_per_instance(model, val_loader, params, means, variances)
-    if anomalies_df.empty:
-        logging.warning("No anomalies detected during validation!")
-        return 0.0, 0.0, 0.0
+    model.eval()
+    pred_by_timestamp = {}
 
-    anomalies_df["timestamp"] = anomalies_df["timestamp"].astype(str)
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Validating", unit="batch"):
+            features = batch['features'].to(device)  # [B, T, num_features]
+            true_labels = batch['labels']            # [B, T]
+            _, class_logits = model(features)
+            pred_labels = torch.argmax(class_logits, dim=-1).cpu()  # [B, T]
+            for ts_list, true_seq, pred_seq in zip(batch['timestamps'], true_labels, pred_labels):
+                for ts, t_label, p_label in zip(ts_list, true_seq.tolist(), pred_seq.tolist()):
+                    pred_by_timestamp[ts] = (t_label, p_label)
 
-    df_gt = pd.read_parquet(params['validation_parquet_path'], columns=['timestamp_str', 'insight'])
-    if "timestamp_str" not in df_gt.columns or "insight" not in df_gt.columns:
-        raise ValueError("Expected both 'timestamp_str' and 'insight' columns in the validation parquet file!")
-    
-    df_gt_filtered = df_gt[df_gt['insight'].notna()][["timestamp_str", "insight"]]
-    df_gt_filtered["timestamp_str"] = df_gt_filtered["timestamp_str"].astype(str)
-    gt_timestamps = set(df_gt_filtered["timestamp_str"].unique())
+    if not pred_by_timestamp:
+        logging.warning("No predictions made during validation!")
+        return 0.0
 
-    anomalies_df["is_accurate"] = anomalies_df["timestamp"].apply(lambda ts: ts in gt_timestamps)
+    # Gather all true and predicted labels.
+    all_true = []
+    all_pred = []
+    for t_label, p_label in pred_by_timestamp.values():
+        all_true.append(t_label)
+        all_pred.append(p_label)
+    all_true = torch.tensor(all_true)
+    all_pred = torch.tensor(all_pred)
 
-    num_accurate = anomalies_df["is_accurate"].sum()
-    total_anoms = len(anomalies_df)
-    total_gt = len(gt_timestamps)
-    precision = (num_accurate / total_anoms) if total_anoms > 0 else 0.0
-    recall = (num_accurate / total_gt) if total_gt > 0 else 0.0
-    f1_score = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    # Calculate accuracy for each class.
+    class_labels = torch.unique(all_true)
+    class_accuracies = {}
+    for label in class_labels:
+        mask = (all_true == label)
+        total = mask.sum().item()
+        correct = (all_true[mask] == all_pred[mask]).sum().item()
+        accuracy = correct / total if total > 0 else 0.0
+        class_accuracies[label.item()] = (correct, total, accuracy)
 
-    logging.info(f"Total anomalies reported by model: {total_anoms}")
-    logging.info(f"Total ground truth anomalies (with insight): {total_gt}")
-    logging.info(f"Total accurate detections: {num_accurate}")
-    logging.info(f"[RESULT] Validation - Precision: {precision*100:.2f}%, Recall: {recall*100:.2f}%, F1-Score: {f1_score*100:.2f}%")
+    # Log individual class accuracies.
+    for label, (correct, total, accuracy) in class_accuracies.items():
+        logging.info(f"Class {label}: {correct}/{total} ({accuracy*100:.2f}%)")
 
-    anomalies_df = anomalies_df.sort_values(by='anomaly_score', ascending=False)
-    anomalies_csv_path = os.path.join(params['output_dir'], 'sorted_anomalies.csv')
-    anomalies_df.to_csv(anomalies_csv_path, index=False)
-    logging.info(f"Sorted anomalies saved to {anomalies_csv_path}")
+    # Separate normal (label 0) and anomaly (labels != 0) samples.
+    normal_mask = (all_true == 0)
+    anomaly_mask = (all_true != 0)
+    normal_total = normal_mask.sum().item()
+    anomaly_total = anomaly_mask.sum().item()
+    normal_correct = (all_true[normal_mask] == all_pred[normal_mask]).sum().item() if normal_total > 0 else 0
+    anomaly_correct = (all_true[anomaly_mask] == all_pred[anomaly_mask]).sum().item() if anomaly_total > 0 else 0
 
-    detected_gt_timestamps = set(anomalies_df[anomalies_df["is_accurate"]]["timestamp"])
-    missed_gt_timestamps = gt_timestamps - detected_gt_timestamps
-    missed_df = df_gt_filtered[df_gt_filtered["timestamp_str"].isin(missed_gt_timestamps)]
-    missed_csv_path = os.path.join(params['output_dir'], 'missed_ground_truth_anomalies.csv')
-    missed_df.to_csv(missed_csv_path, index=False)
-    logging.info(f"Missed ground truth anomalies saved to {missed_csv_path}")
+    normal_acc = normal_correct / normal_total if normal_total > 0 else 0.0
+    anomaly_acc = anomaly_correct / anomaly_total if anomaly_total > 0 else 0.0
+    balanced_acc = (normal_acc + anomaly_acc) / 2.0
 
-    if not df_gt_filtered.empty:
-        detected_gt_df = anomalies_df[anomalies_df["is_accurate"]].merge(
-            df_gt_filtered, left_on='timestamp', right_on='timestamp_str', how='left'
-        )
-        detection_counts = detected_gt_df['insight'].value_counts().sort_index()
-        total_counts = df_gt_filtered['insight'].value_counts().sort_index()
-        detection_rate = (detection_counts / total_counts * 100).fillna(0)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        detection_rate.plot(kind='bar', ax=ax)
-        ax.set_xlabel("Anomaly Type")
-        ax.set_ylabel("Detection Rate (%)")
-        ax.set_title("Detection Rate by Anomaly Type")
-        plt.tight_layout()
-        detection_rate_plot_path = os.path.join(params['output_dir'], 'anomaly_detection_rates.png')
-        plt.savefig(detection_rate_plot_path)
-        plt.close()
-        logging.info(f"Anomaly detection rates plot saved to {detection_rate_plot_path}")
-    else:
-        logging.warning("No valid ground truth rows with 'insight' available; skipping detection rate plot.")
+    logging.info(f"Normal Instances: {normal_correct}/{normal_total} ({normal_acc*100:.2f}%)")
+    logging.info(f"Anomaly Instances: {anomaly_correct}/{anomaly_total} ({anomaly_acc*100:.2f}%)")
+    logging.info(f"Balanced Accuracy: {balanced_acc*100:.2f}%")
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.hist(anomalies_df['anomaly_score'], bins=50, color='skyblue', edgecolor='black')
-    ax.set_xlabel("Anomaly Score")
-    ax.set_ylabel("Frequency")
-    ax.set_title("Histogram of Anomaly Scores")
-    histogram_plot_path = os.path.join(params['output_dir'], 'anomaly_score_histogram.png')
-    plt.tight_layout()
-    plt.savefig(histogram_plot_path)
-    plt.close()
-    logging.info(f"Anomaly score histogram saved to {histogram_plot_path}")
+    return balanced_acc
 
-    if not df_gt_filtered.empty:
-        detected_gt_df = anomalies_df[anomalies_df["is_accurate"]].merge(
-            df_gt_filtered, left_on='timestamp', right_on='timestamp_str', how='left'
-        )
-        if not detected_gt_df.empty:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            detected_gt_df.boxplot(column='anomaly_score', by='insight', ax=ax)
-            ax.set_xlabel("Anomaly Type")
-            ax.set_ylabel("Anomaly Score")
-            ax.set_title("Anomaly Score Distribution by Anomaly Type")
-            plt.suptitle("")
-            boxplot_path = os.path.join(params['output_dir'], 'anomaly_score_boxplot_by_insight.png')
-            plt.tight_layout()
-            plt.savefig(boxplot_path)
-            plt.close()
-            logging.info(f"Anomaly score boxplot by insight saved to {boxplot_path}")
-    return precision, recall, f1_score
+
 
 def plot_latent_space(model, val_loader, params):
     model.eval()
@@ -332,7 +195,7 @@ def plot_latent_space(model, val_loader, params):
     with torch.no_grad():
         for batch in val_loader:
             features = batch['features'].to(device)
-            outputs, latents = model(features, return_latents=True)
+            _, _, latents = model(features, return_latents=True)
             all_latents.append(latents.cpu().numpy())
     if not all_latents:
         logging.warning("No latent representations found for plotting.")
@@ -396,31 +259,3 @@ def log_model_size(model: torch.nn.Module, device: torch.device = None) -> None:
     total_bytes = total_params * bytes_per_param
     size_mb = total_bytes / (1024**2)
     logging.info(f"Approximate model size: {size_mb:.2f} MB (assuming fp32)")
-
-def center_margin_loss(proj_latents, rule_flags, margin=1.0):
-    """
-    Computes a simple loss that encourages normal timestamps (rule_flags==False)
-    to have latent representations close to the normal center and forces the
-    anomalous ones (rule_flags==True) to lie at least a margin away.
-    proj_latents: [B, T, d]
-    rule_flags: [B, T] (boolean tensor)
-    """
-    B, T, d = proj_latents.shape
-    X = proj_latents.view(-1, d)          # [B*T, d]
-    labels = rule_flags.view(-1).float()  # [B*T], 0 for normal, 1 for anomaly
-
-    if (labels == 0).sum() > 0:
-        center_normal = X[labels == 0].mean(dim=0)
-    else:
-        center_normal = torch.zeros(d, device=X.device)
-
-    normal_loss = 0.0
-    if (labels == 0).sum() > 0:
-        normal_loss = torch.mean(((X[labels == 0] - center_normal)**2).sum(dim=1))
-    
-    anomaly_loss = 0.0
-    if (labels == 1).sum() > 0:
-        distances = torch.sqrt(((X[labels == 1] - center_normal)**2).sum(dim=1) + EPS)
-        anomaly_loss = torch.mean(torch.relu(margin - distances)**2)
-    
-    return normal_loss + anomaly_loss

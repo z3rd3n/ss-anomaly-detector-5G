@@ -1,18 +1,16 @@
+
 import torch
 from torch import nn
 
-class NumericalAutoencoder(nn.Module):
-    def __init__(self, num_features, hidden_dim, dropout=0.1, proj_dim=32):
+class Model(nn.Module):
+    def __init__(self, num_features, hidden_dim, dropout=0.1, num_classes=5):
         """
-        A CNN + Self-Attention based sequence autoencoder that operates on normalized numerical features.
-        In addition to reconstruction (via one output head per feature), it projects the internal representation
-        into a latent space for contrastive learning.
-        
-        Args:
-            num_features: int, number of input features.
-            hidden_dim: hidden dimension for the convolution and attention layers.
-            dropout: dropout probability.
-            proj_dim: dimension of the projected latent space.
+        A CNN+Self-Attention autoencoder for numerical features that includes:
+         - Reconstruction via per-feature output heads.
+         - A latent space from the encoder.
+         - A classification head that outputs 5 classes:
+             4 for rule–based anomalies,
+             1 for not anomaly (normal),
         """
         super().__init__()
         self.num_features = num_features
@@ -23,24 +21,27 @@ class NumericalAutoencoder(nn.Module):
         
         self.attention = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, dropout=dropout, batch_first=True)
         
-        # One output head per feature.
-        self.output_heads = nn.ModuleList([
-            nn.Linear(hidden_dim, 1) for _ in range(num_features)
-        ])
-        # Projection head for contrastive learning.
-        self.contrast_head = nn.Linear(hidden_dim, proj_dim)
+        # Reconstruction heads: one per feature.
+        self.output_heads = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(num_features)])
+        
+        # Classification head on the latent space.
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, 128),  
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
+        )
     
     def forward(self, x, return_latents=False):
         """
-        Forward pass.
-        
         Args:
-            x: Tensor of shape [B, T, num_features] (normalized values).
-            return_latents: If True, also returns the projected latent representations (per timestamp).
-        
+            x: [B, T, num_features] normalized input.
+            return_latents: if True, also return latent representations.
         Returns:
-            outputs: List of predictions for each feature, each of shape [B, T, 1].
-            If return_latents is True, also returns proj_latents: Tensor of shape [B, T, proj_dim].
+            outputs: list of [B, T, 1] reconstructions (one per feature).
+            class_logits: [B, T, num_classes] classification outputs.
+            (optionally) attn_output: latent representations [B, T, hidden_dim].
         """
         batch_size, seq_len, _ = x.size()
         x_conv = x.transpose(1, 2)  # [B, num_features, T]
@@ -53,9 +54,9 @@ class NumericalAutoencoder(nn.Module):
         attn_output = self.attention(combined)  # [B, T, hidden_dim]
         
         outputs = [head(attn_output) for head in self.output_heads]  # list of [B, T, 1]
+        class_logits = self.classifier(attn_output)  # [B, T, num_classes]
         
         if return_latents:
-            # Project per-timestep latent representations.
-            proj_latents = self.contrast_head(attn_output)  # [B, T, proj_dim]
-            return outputs, proj_latents
-        return outputs
+            return outputs, class_logits, attn_output
+        else:
+            return outputs, class_logits

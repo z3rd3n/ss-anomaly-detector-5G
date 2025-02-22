@@ -1,110 +1,170 @@
+# trainer.py
 import os
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
 from dataset import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
-
+import json
 import logging
+
 from utils import (save_checkpoint, start_logging, validate_csv, 
-                   compute_features_statistics, log_model_size, EPS,
-                   center_margin_loss)
-from model import NumericalAutoencoder
+                   compute_features_statistics, log_model_size, EPS, load_checkpoint)
+from model import Model
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None, reduction='mean', ignore_normal=True):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight  # Tensor of shape [num_classes]
+        self.reduction = reduction
+        self.ignore_normal = ignore_normal  # if True, ignore loss for class 0
+
+    def forward(self, inputs, targets):
+        # Compute cross entropy loss per sample.
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.ignore_normal:
+            # Create a mask that is 0 for normal instances (label 0) and 1 otherwise.
+            mask = (targets != 0).float()
+            focal_loss = focal_loss * mask
+            if self.reduction == 'mean':
+                # Average only over non-normal instances (avoid dividing by 0)
+                return focal_loss.sum() / (mask.sum() + 1e-8)
+            elif self.reduction == 'sum':
+                return focal_loss.sum()
+            else:
+                return focal_loss
+        else:
+            if self.reduction == 'mean':
+                return focal_loss.mean()
+            elif self.reduction == 'sum':
+                return focal_loss.sum()
+            else:
+                return focal_loss
+
 
 def train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances):
     num_epochs = params.get('num_epochs', 10)
-    best_f1 = 0.0
-    contrast_lambda = params.get('contrast_lambda', 1.0)  # weight for contrastive loss
+    best_val_class_acc = 0.0
+
+    
+    num_classes = 5
+    # Example class weights – adjust these if needed.
+    weights = torch.tensor([0.02, 0.25, 0.35, 0.20, 0.18])
+    focal_loss_fn = FocalLoss(gamma=2.0, weight=weights.to(device), reduction='mean')
+    
+    mse_loss_fn = nn.MSELoss()
 
     for epoch in range(1, num_epochs + 1):
         model.train()
-        epoch_loss = 0.0
-        with tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{num_epochs}", unit="batch") as pbar:
-            for batch in train_loader:
-                optimizer.zero_grad()
-                # features shape: [B, T, num_features]
-                features = batch['features'].to(device)
-                # rule_flags: [B, T] (bool tensor indicating rule-based anomaly at each timestamp)
-                rule_flags = batch['rule_flags'].to(device)
-                
-                # Forward pass with latent extraction.
-                outputs, proj_latents = model(features, return_latents=True)
-                # Concatenate outputs along feature dim to get shape [B, T, num_features]
-                outputs_concat = torch.cat(outputs, dim=-1)
-                
-                # Reconstruction loss per feature (weighted by inverse variance)
-                loss = F.mse_loss(outputs_concat, features, reduction='none')  # [B, T, num_features]
-                weights = torch.tensor(
-                    [1.0 / (variances[i].item() + EPS) for i in range(model.num_features)],
-                    device=device
-                )  # shape: [num_features]
-                weighted_loss = loss * weights  # broadcasting over B and T
-                rec_loss = weighted_loss.mean()
-                
-                # Compute contrastive (center margin) loss on the projected latents.
-                contrast_loss = center_margin_loss(proj_latents, rule_flags, margin=params.get('contrast_margin', 1.0))
-                
-                total_loss = rec_loss + contrast_lambda * contrast_loss
-                total_loss.backward()
-                optimizer.step()
-                epoch_loss += total_loss.item()
-                pbar.set_postfix(loss=f"{total_loss.item():.4f}", rec_loss=f"{rec_loss.item():.4f}", contrast_loss=f"{contrast_lambda * contrast_loss.item():.4f}")
-                pbar.update(1)
-        avg_loss = epoch_loss / len(train_loader)
-        logging.info(f"Epoch {epoch}/{num_epochs}: Average Loss = {avg_loss:.4f}")
+        total_loss_epoch = 0.0
+        total_batches = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", unit="batch")
+        for batch_idx, batch in enumerate(pbar):
+            if batch_idx >= 200:
+                break
+            optimizer.zero_grad()
+            features = batch['features'].to(device)    # shape: [B, T, num_features]
+            true_labels = batch['labels'].to(device)     # shape: [B, T]
+
+            # Forward pass.
+            recon, class_logits = model(features)  # recon: [B, T, num_features], logits: [B, T, num_classes]
+            recon = torch.cat(recon, dim=-1)  # [B, T, num_features]
+            
+            # Reconstruction loss.
+            recon_loss = mse_loss_fn(recon, features)
+            
+            # Classification loss computed per time step.
+            clf_loss = focal_loss_fn(class_logits.view(-1, num_classes), true_labels.view(-1))
+            
+            # Total loss is the sum (you may weight each term as needed).
+            total_loss = recon_loss + clf_loss
+            total_loss.backward()
+            optimizer.step()
+            
+            total_loss_epoch += total_loss.item()
+            total_batches += 1
+            pbar.set_postfix({"Loss": f"{total_loss.item():.4f}",
+                              "Recon": f"{recon_loss.item():.4f}",
+                              "Clf": f"{clf_loss.item():.4f}"})
+            
+        avg_loss = total_loss_epoch / total_batches
+        logging.info(f"Epoch {epoch} Average Loss: {avg_loss:.4f}")
         
-        # Perform CSV validation at the end of each epoch.
-        precision, recall, f1 = validate_csv(model, params, means, variances)
-        logging.info(f"Epoch {epoch}: Precision = {precision:.4f}, Recall = {recall:.4f}, F1 = {f1:.4f}")
-        if f1 > best_f1:
-            best_f1 = f1
+        # Validate and report per–instance metrics.
+        val_class_acc = validate_csv(model, params, means, variances, device)
+        logging.info(f"Validation Classification Accuracy: {val_class_acc*100:.2f}%")
+        
+        if val_class_acc > best_val_class_acc:
+            best_val_class_acc = val_class_acc
             checkpoint_state = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_f1': best_f1,
+                'best_val_class_acc': best_val_class_acc,
                 'params': params,
             }
             filename = os.path.join(params['output_dir'], 'best_model.pt')
             save_checkpoint(checkpoint_state, filename)
-    return model, best_f1
+    return model, best_val_class_acc
 
-def main_training_pipeline(params, model):
+def main_training_pipeline(params, model, train=True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    # Create the training dataset (now including subtle anomalies).
-    train_dataset = ParquetSequenceDataset(
-        parquet_path=params['parquet_path'],
-        feature_columns=params['feature_columns'],
-        seq_len=params['seq_len'],
-        stride=params['stride'],
-        ratio=params['train_ratio'],
-        seed=params['seed'],
-        skip_anomalies=False,  # Include subtle anomalies during training.
-        normalization_stats=None  # Initially load raw data for computing stats.
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=params['batch_size'],
-        shuffle=False,
-        collate_fn=custom_collate_fn,
-    )
+    if train:
+        # Create the training dataset (including anomalies and per–timestamp labels).
+        train_dataset = ParquetSequenceDataset(
+            parquet_path=params['parquet_path'],
+            feature_columns=params['feature_columns'],
+            seq_len=params['seq_len'],
+            stride=params['stride'],
+            ratio=params['train_ratio'],
+            seed=params['seed'],
+            skip_anomalies=False,  # include all instances for training
+            normalization_stats=None  # initially unnormalized to compute stats
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=params['batch_size'],
+            shuffle=False,
+            collate_fn=custom_collate_fn,
+        )
 
-    # Compute feature statistics from the raw training data.
-    num_features = len(params['feature_columns'])
-    means, variances = compute_features_statistics(train_loader, params, num_features)
-    
-    # Reinitialize the dataset with normalization enabled.
-    train_dataset.normalization_stats = {'means': means, 'variances': variances}
-    
-    log_model_size(model, device)
+        # Compute per–feature statistics.
+        num_features = len(params['feature_columns'])
+        means, variances = compute_features_statistics(train_loader, params, num_features)
+        # Reinitialize dataset with normalization.
+        train_dataset.normalization_stats = {'means': means, 'variances': variances}
+        
+        log_model_size(model, device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=params.get('lr', 1e-3))
+        model, best_acc = train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances)
+        logging.info(f"Training complete. Best Validation Classification Accuracy: {best_acc:.4f}")
+    else:
+        # Load the model from the checkpoint.
+        checkpoint_path = os.path.join(params['output_dir'], 'best_model.pt')
+        optimizer = torch.optim.Adam(model.parameters(), lr=params.get('lr', 1e-3))
+        _, best_acc, params = load_checkpoint(checkpoint_path, model, optimizer)
+        logging.info(f"Loaded model for validation. Best Validation Accuracy: {best_acc:.4f}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=params.get('lr', 1e-3))
-    model, best_f1 = train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances)
-    logging.info(f"Training complete. Best validation F1: {best_f1:.4f}")
+        # Load normalization statistics.
+        stats_file = params['features_stats_json']
+        with open(stats_file, 'r') as f:
+            stats = json.load(f)
+        means = torch.tensor(stats['means'], dtype=torch.float32)
+        variances = torch.tensor(stats['variances'], dtype=torch.float32)
+
+    # Perform validation.
+    val_class_acc = validate_csv(model, params, means, variances, device)
+    logging.info(f"Final Classification Accuracy: {val_class_acc*100:.2f}%")
     return model, params
 
 if __name__ == '__main__':
@@ -116,26 +176,25 @@ if __name__ == '__main__':
         'feature_columns': ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
         'seq_len': 20,
         'stride': 10,
-        'train_ratio': 0.1,
+        'train_ratio': 0.001,
         'val_ratio': 1.0,
         'seed': 42,
         'batch_size': 64,
         'num_epochs': 3,
         'lr': 5e-4,
-        'hidden_dim': 128,  # Reduced to enforce a stronger bottleneck.
-        'percentile': 95,
+        'hidden_dim': 64,
         'dropout': 0.5,
         'pca_n_components': 2,
         'features_stats_json': 'features_stats.json',
-        'skip_anomalies': False,  # Do not skip rule-based anomalies
-        'contrast_lambda': 1.0,   # Weight for contrastive loss term
-        'contrast_margin': 2.0,   # Margin for the contrastive loss
-        'contrast_beta': 0.5,     # Weight for adding contrastive anomaly score at inference
+        'skip_anomalies': False,
+        'train': True,
     }
 
     start_logging(params)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_features = len(params['feature_columns'])
-    model = NumericalAutoencoder(num_features=num_features, hidden_dim=params['hidden_dim'], dropout=params['dropout'])
+    model = Model(num_features=num_features, hidden_dim=params['hidden_dim'], dropout=params['dropout'])
     model.to(device)
-    model, params = main_training_pipeline(params, model)
+
+    model, params = main_training_pipeline(params, model, params['train'])
+    logging.info("Training complete.")

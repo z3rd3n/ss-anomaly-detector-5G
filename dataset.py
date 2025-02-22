@@ -1,28 +1,26 @@
-import os
-import json
+#dataset.py 
 import random
 import logging
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import IterableDataset
-import pyarrow.parquet as pq
 
-EPS = 1e-8  # small constant to avoid divide-by-zero
+EPS = 1e-8  # small constant
 
 def custom_collate_fn(batch):
     """
-    Custom collate function to merge a list of samples into a batch.
+    Merges a list of samples into a batch.
+    Now also stacks 'labels' (per timestamp) if present.
     """
     try:
         features = torch.stack([item['features'] for item in batch])
         timestamps = [item['timestamps'] for item in batch]
-        rule_flags = torch.stack([item['rule_flags'] for item in batch])
-        return {
-            'features': features,
-            'timestamps': timestamps,
-            'rule_flags': rule_flags
-        }
+        labels = torch.stack([item['labels'] for item in batch]) if 'labels' in batch[0] else None
+        out = {'features': features, 'timestamps': timestamps}
+        if labels is not None:
+            out['labels'] = labels
+        return out
     except Exception as e:
         logging.error(f"Error in collate_fn: {e}")
         return {}
@@ -30,28 +28,20 @@ def custom_collate_fn(batch):
 class ParquetSequenceDataset(IterableDataset):
     def __init__(self,
                  parquet_path: str,
-                 feature_columns: list,  # expected numeric feature columns (e.g., ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI'])
+                 feature_columns: list,  # e.g., ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI']
                  seq_len: int,
                  stride: int = None,
                  shuffle_files: bool = True,
-                 ratio: float = 0.2,  # ratio of total rows to include
+                 ratio: float = 0.2,
                  seed: int = 42,
-                 skip_anomalies: bool = True,
+                 skip_anomalies: bool = False,  # include anomalies for classification
                  normalization_stats: dict = None):
         """
-        Args:
-            parquet_path: Path to the parquet file.
-            feature_columns: List of column names to use as features.
-            seq_len: Length of each sequence.
-            stride: Step between sequences (if None, defaults to seq_len, i.e. no overlap).
-            shuffle_files: Whether to shuffle the files before iterating.
-            ratio: Fraction (0-1) of the total rows (across files) to use.
-            seed: Random seed for shuffling.
-            skip_anomalies: If True, skip sequences that cause errors, contain NaNs, or are flagged by rule_based_flags.
-            normalization_stats: A dict containing 'means' and 'variances' for feature normalization.
+        Loads sequences from a parquet file.
+        Each sample now includes a 'labels' tensor computed by rule_based_labels().
         """
         self.parquet_path = parquet_path
-        self.feature_columns = feature_columns  # e.g., ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI']
+        self.feature_columns = feature_columns
         self.seq_len = seq_len
         self.stride = stride if stride is not None else seq_len
         self.shuffle_files = shuffle_files
@@ -60,13 +50,12 @@ class ParquetSequenceDataset(IterableDataset):
         self.skip_anomalies = skip_anomalies
         self.normalization_stats = normalization_stats
 
-        # Pre-read only the file_id column to compute per-file row counts efficiently.
+        # Pre-read file_id column to compute row counts.
         df_ids = pd.read_parquet(self.parquet_path, columns=['file_id'])
         self.total_rows = len(df_ids)
         file_counts = df_ids['file_id'].value_counts().to_dict()
         self.all_file_ids = sorted(list(file_counts.keys()))
         
-        # Determine which file_ids to include based on the ratio.
         if self.shuffle_files:
             random.seed(self.seed)
             file_ids_shuffled = self.all_file_ids.copy()
@@ -84,7 +73,6 @@ class ParquetSequenceDataset(IterableDataset):
                 break
         
         logging.info(f"Selected {len(self.selected_file_ids)} files for training.")
-        # Precompute number of sequences per file.
         self.file_seq_counts = {}
         total_seq = 0
         for fid in self.selected_file_ids:
@@ -95,9 +83,6 @@ class ParquetSequenceDataset(IterableDataset):
         self._length = total_seq
 
     def _normalize(self, features: torch.Tensor):
-        """
-        Normalize features using provided mean and variance statistics.
-        """
         if not self.normalization_stats:
             return features
 
@@ -111,42 +96,28 @@ class ParquetSequenceDataset(IterableDataset):
         std = torch.sqrt(variances + EPS)
         return (features.float() - means) / std
 
-    def rule_based_flags(self, seq_tensor: torch.Tensor) -> bool:
-        """
-        Apply custom rules to a sequence tensor.
-        Return True if the sequence should be skipped.
-        Replace the following logic with your own rules.
-        Example: Skip if any feature is negative.
-        """
-        # Example rule: If any element is negative, flag this sequence.
-        return (seq_tensor < 0).any().item()
-
     def __iter__(self):
-        # Optionally shuffle the order of file_ids for each epoch.
         file_ids = self.selected_file_ids.copy()
         if self.shuffle_files:
             random.shuffle(file_ids)
 
         for fid in file_ids:
-            # Efficiently read rows corresponding to the current file_id.
             df = pd.read_parquet(self.parquet_path, filters=[('file_id', '==', fid)])
             df = df.reset_index(drop=True)
             num_rows = len(df)
             if num_rows < self.seq_len:
-                continue  # Skip files that are too short.
+                continue
 
-            # Retrieve timestamps (if available) and features.
             timestamps_all = df['timestamp_str'].tolist() if 'timestamp_str' in df.columns else ["" for _ in range(num_rows)]
             try:
                 features_all = df[self.feature_columns].to_numpy()
             except Exception as e:
-                logging.error(f"Error extracting feature columns from file_id {fid}: {e}")
+                logging.error(f"Error extracting features from file_id {fid}: {e}")
                 if self.skip_anomalies:
                     continue
                 else:
                     raise e
 
-            # Create sequences with the specified stride.
             for start in range(0, num_rows - self.seq_len + 1, self.stride):
                 end = start + self.seq_len
                 seq_features = features_all[start:end]
@@ -160,62 +131,80 @@ class ParquetSequenceDataset(IterableDataset):
                     else:
                         raise e
 
-                # Skip sequence if it contains NaNs.
                 if self.skip_anomalies and torch.isnan(seq_tensor).any():
                     continue
 
-                seq_rule_flags = rule_based_flags(seq_tensor)  
-                # Apply rule-based flag check.
-                if self.skip_anomalies:
-                    if seq_rule_flags:
-                        continue
-        
+                # Compute per-timestamp rule-based labels.
+                labels = rule_based_labels(seq_tensor)  # tensor of shape [seq_len]
+                
                 norm_features = self._normalize(seq_tensor)
-                rule_flags_tensor = seq_rule_flags.to(torch.int8)
 
                 yield {
                     'features': norm_features,
                     'timestamps': seq_timestamps,
-                    'rule_flags': rule_flags_tensor
+                    'labels': labels
                 }
 
     def __len__(self):
         return self._length
 
-
-def rule_based_flags(sequence: torch.Tensor) -> torch.Tensor:
+def rule_based_labels(sequence: torch.Tensor) -> torch.Tensor:
     """
-    Use a Pandas DataFrame and groupby to flag anomalous timesteps in the sequence.
-    The rules applied (to match method 2) are:
-      - Unnecessary ReTx: If ReTx > 0 and the previous CRC was 1.
-      - Missing ReTx: If ReTx == 0 and the previous CRC was 0.
-      - New Data but No ReTx: If the previous CRC is 0 and the current NDI is different from the previous NDI.
-      - Max ReTx Achieved: If ReTx equals (MAX_RETX + 1).
+    Computes rule-based anomaly labels for each time step using tensor operations.
     
-    Assumes the sequence tensor has shape (seq_len, 7) with columns:
-      ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]
+    Assumes the input tensor `sequence` has shape [T, 7] with columns:
+      0: SFN, 1: Slot, 2: HARQ, 3: MCS, 4: CRC, 5: ReTx, 6: NDI.
+    
+    Labels:
+      0: Normal
+      1: Unnecessary ReTx (ReTx increased when previous CRC == 1)
+      2: Missing ReTx (for new data events: previous CRC == 0, NDI changed, but ReTx did not increase relative to previous HARQ)
+      3: New Data (for new data events: previous CRC == 0, NDI changed, and ReTx increased relative to previous HARQ)
+      4: Max ReTx Achieved (ReTx == MAX_RETX)
+      5: Likely Anomaly (if needed)
     """
-    # Convert tensor to numpy array and create DataFrame
-
     MAX_RETX = 4
-    arr = sequence.cpu().numpy()
-    columns = ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"]
-    df = pd.DataFrame(arr, columns=columns)
+    T = sequence.size(0)
     
-    # Use groupby to simulate SQL's LAG function.
-    df['prev_crc'] = df.groupby('HARQ')['CRC'].shift(1)
-    df['prev_ndi'] = df.groupby('HARQ')['NDI'].shift(1)
+    # Extract relevant columns.
+    HARQ = sequence[:, 2]
+    CRC = sequence[:, 4]
+    ReTx = sequence[:, 5]
+    NDI = sequence[:, 6]
     
-    # Compute anomaly flags per the specified rules:
-    flag_unnecessary_retx = (df['ReTx'] > 0) & (df['prev_crc'] == 1)
-    flag_missing_retx     = (df['ReTx'] == 0) & (df['prev_crc'] == 0)
-    flag_new_data_no_retx = (df['prev_crc'] == 0) & (df['NDI'] != df['prev_ndi'])
-    flag_max_retx         = (df['ReTx'] == (MAX_RETX))
+    # Initialize previous values with a placeholder (-1).
+    prev_crc = torch.full((T,), -1, dtype=CRC.dtype, device=CRC.device)
+    prev_ndi = torch.full((T,), -1, dtype=NDI.dtype, device=NDI.device)
+    prev_retx = torch.full((T,), -1, dtype=ReTx.dtype, device=ReTx.device)
     
-    # Combine all conditions to create the final flag.
-    flags = flag_unnecessary_retx | flag_missing_retx | flag_new_data_no_retx | flag_max_retx
+    # For each HARQ group, shift the previous values.
+    unique_harq = torch.unique(HARQ)
+    for h in unique_harq:
+        indices = (HARQ == h).nonzero(as_tuple=False).squeeze(1)
+        if indices.numel() > 1:
+            prev_crc[indices[1:]] = CRC[indices[:-1]]
+            prev_ndi[indices[1:]] = NDI[indices[:-1]]
+            prev_retx[indices[1:]] = ReTx[indices[:-1]]
     
-    # Convert flags back to a Torch tensor and return.
-    return torch.tensor(flags.values, dtype=torch.bool) 
+    # Initialize labels as Normal.
+    labels = torch.zeros(T, dtype=torch.long, device=sequence.device)
+    
+    # Rule 4: Max ReTx Achieved.
+    cond_max = (ReTx >= MAX_RETX)
+    labels[cond_max] = 4
+    
+    # Rule 1: Unnecessary ReTx (ReTx increased compared to previous HARQ when previous CRC == 1).
+    cond_unnecessary = (ReTx > prev_retx) & (prev_crc == 1)
+    labels[cond_unnecessary] = 1
+    
+    # Rule 2: Missing ReTx but no new data
+    cond_missing = (prev_crc == 0) & (ReTx == prev_retx) & (NDI == prev_ndi)
+    labels[cond_missing] = 2
+    
+    # Rule 3: New data but no ReTx increase
+    cond_new_data_actual = (prev_crc == 0) & (ReTx == prev_retx) & (NDI != prev_ndi)
+    labels[cond_new_data_actual] = 3
+    
+    return labels
 
 
