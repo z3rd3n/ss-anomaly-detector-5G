@@ -275,25 +275,20 @@ def plot_performance_metrics(all_true, all_pred, params):
     import matplotlib.pyplot as plt
     from sklearn.metrics import confusion_matrix
 
-    class_names = {
-        0: "normal",
-        1: "unnecessary_retx",
-        2: "missing_retx",
-        3: "new_data_no_retx",
-        4: "max_retx_achieved"
-    }
-
     # Compute the confusion matrix.
     cm = confusion_matrix(all_true, all_pred)
     plt.figure(figsize=(10, 8))
     plt.imshow(cm, interpolation='nearest', cmap='Blues')
     plt.title("Confusion Matrix")
     plt.colorbar()
-    tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, [class_names[i] for i in tick_marks], rotation=45)
-    plt.yticks(tick_marks, [class_names[i] for i in tick_marks])
+    tick_marks = np.arange(len(np.unique(all_true)))
+    plt.xticks(tick_marks, tick_marks)
+    plt.yticks(tick_marks, tick_marks)
     plt.xlabel("Predicted Class")
     plt.ylabel("True Class")
+
+    cm = confusion_matrix(all_true, all_pred)
+    logging.info("Confusion Matrix:\n%s", cm)
 
     # Annotate the confusion matrix.
     thresh = cm.max() / 2.
@@ -315,7 +310,7 @@ def plot_performance_metrics(all_true, all_pred, params):
         acc = (all_true[mask] == all_pred[mask]).float().mean() if mask.sum() > 0 else 0
         accuracies.append(acc)
     plt.figure(figsize=(10, 6))
-    plt.bar([class_names[cls] for cls in classes], accuracies, color='skyblue')
+    plt.bar(classes, accuracies, color='skyblue')
     plt.title("Detection Ratio by Class")
     plt.xlabel("Class")
     plt.ylabel("Accuracy")

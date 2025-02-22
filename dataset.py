@@ -154,9 +154,11 @@ class ParquetSequenceDataset(IterableDataset):
     def report_class_counts(self):
         """
         Goes through all selected training files, counts the number of rows for each class,
-        and logs the distribution.
+        and logs the distribution. Also checks that the total number of labels matches the number of rows.
         """
         counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+        total_labels = 0
+        total_rows = 0
         for fid in self.selected_file_ids:
             try:
                 df = pd.read_parquet(self.parquet_path, columns=['insight'], filters=[('file_id', '==', fid)])
@@ -166,6 +168,14 @@ class ParquetSequenceDataset(IterableDataset):
             for insight in df['insight']:
                 label = self.insight_to_label(insight)
                 counts[label] += 1
+                total_labels += 1
+            total_rows += len(df)
+        
+        if total_labels != total_rows:
+            logging.error(f"Total number of labels ({total_labels}) does not match total number of rows ({total_rows}).")
+        else:
+            logging.info(f"Total number of labels matches total number of rows: {total_rows}")
+
         logging.info("Class distribution in training files:")
         reverse_mapping = {v: k for k, v in self.anomaly_mapping.items()}
         reverse_mapping[0] = "normal"

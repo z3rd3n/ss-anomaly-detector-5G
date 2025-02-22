@@ -70,7 +70,7 @@ def train_anomaly_detector(model, train_loader, optimizer, device, params, means
     alpha = alpha.to(device)
 
     # Then initialize your loss:
-    focal_loss_fn = FocalLoss(gamma=2.0, alpha=alpha, reduction='mean')
+    focal_loss_fn = FocalLoss(gamma=3.0, alpha=alpha, reduction='mean')
 
     
     mse_loss_fn = nn.MSELoss()
@@ -96,15 +96,38 @@ def train_anomaly_detector(model, train_loader, optimizer, device, params, means
             clf_loss = focal_loss_fn(class_logits.view(-1, len(counts)), true_labels.view(-1))
             
             # Total loss is the sum (you may weight each term as needed).
-            total_loss = recon_loss + clf_loss
+            total_loss = recon_loss + 100 * clf_loss
             total_loss.backward()
             optimizer.step()
             
+            # --- New code: compute batch-level accuracy metrics ---
+            # Get predictions.
+            pred_labels = torch.argmax(class_logits, dim=-1)
+            
+            # Masks for normal (0) and anomalies (1-4).
+            normal_mask = (true_labels == 0)
+            anomaly_mask = (true_labels != 0)
+            
+            # Compute correct predictions and totals.
+            normal_total = normal_mask.sum().item()
+            anomaly_total = anomaly_mask.sum().item()
+            normal_correct = (pred_labels[normal_mask] == true_labels[normal_mask]).sum().item() if normal_total > 0 else 0
+            anomaly_correct = (pred_labels[anomaly_mask] == true_labels[anomaly_mask]).sum().item() if anomaly_total > 0 else 0
+            
+            # Compute accuracy (avoid division by zero).
+            normal_acc = normal_correct / normal_total if normal_total > 0 else 0.0
+            anomaly_acc = anomaly_correct / anomaly_total if anomaly_total > 0 else 0.0
+            
             total_loss_epoch += total_loss.item()
             total_batches += 1
-            pbar.set_postfix({"Loss": f"{total_loss.item():.4f}",
-                              "Recon": f"{recon_loss.item():.4f}",
-                              "Clf": f"{clf_loss.item():.4f}"})
+            pbar.set_postfix({
+                "Loss": f"{total_loss.item():.4f}",
+                "Recon": f"{recon_loss.item():.4f}",
+                "Clf": f"{clf_loss.item():.4f}",
+                "Acc_Normal": f"{normal_acc*100:.2f}%",
+                "Acc_Anomaly": f"{anomaly_acc*100:.2f}%"
+            })
+
             
         avg_loss = total_loss_epoch / total_batches
         logging.info(f"Epoch {epoch} Average Loss: {avg_loss:.4f}")
@@ -173,9 +196,6 @@ def main_training_pipeline(params, model, train=True):
         means = torch.tensor(stats['means'], dtype=torch.float32)
         variances = torch.tensor(stats['variances'], dtype=torch.float32)
 
-    # Perform validation.
-    val_class_acc = validate_csv(model, params, means, variances, device)
-    logging.info(f"Final Classification Accuracy: {val_class_acc*100:.2f}%")
     return model, params
 
 if __name__ == '__main__':
@@ -191,7 +211,7 @@ if __name__ == '__main__':
         'val_ratio': 1.0,
         'seed': 42,
         'batch_size': 64,
-        'num_epochs': 3,
+        'num_epochs': 1,
         'lr': 5e-4,
         'hidden_dim': 64,
         'dropout': 0.5,
