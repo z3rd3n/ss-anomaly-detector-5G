@@ -1,244 +1,292 @@
 import os
-import argparse
 import logging
-import json
 import torch
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from model import TwoPhaseModel
-from dataset import ParquetSequenceDataset, custom_collate_fn
 from torch.utils.data import DataLoader
-from utils import start_logging
+import torch.nn.functional as F
 
-def load_model(model_path, config_path=None, device=None):
-    """
-    Load a trained model from checkpoint
-    
-    Args:
-        model_path: Path to model checkpoint
-        config_path: Path to model configuration (optional)
-        device: Device to load model to
-    
-    Returns:
-        model: Loaded model
-        config: Model configuration
-    """
-    # Determine device
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load configuration
-    if config_path is not None and os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-    else:
-        # Try to extract config from checkpoint
-        checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
-        
-        if 'params' in checkpoint:
-            config = checkpoint['params']
-        else:
-            raise ValueError("No configuration found. Please provide a config file.")
-    
-    # Create model
-    feature_ranges = config.get('feature_ranges', [1023, 30, 15, 32, 1, 8, 1])
-    model = TwoPhaseModel(feature_ranges, config)
-    
-    # Load weights
-    checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    
-    return model, config
+from dataset import SequenceStateCacheDataset, custom_collate_fn
+from utils import EPS
 
-def run_inference(model, data_path, config, output_path=None, device=None):
+def run_inference(model, test_data_path, params, device):
     """
-    Run inference on new data
+    Run inference on test data and return anomaly predictions.
     
     Args:
         model: Trained model
-        data_path: Path to data file
-        config: Model configuration
-        output_path: Path to save results (optional)
+        test_data_path: Path to test data parquet file
+        params: Dictionary of parameters
         device: Device to run inference on
-    
+        
     Returns:
-        results: Dictionary of results
+        DataFrame with original data and anomaly predictions
     """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Running inference on {test_data_path}")
     
-    logging.info(f"Running inference on {data_path}")
-    
-    # Load feature statistics
-    stats_file = config.get('features_stats_json', 'features_stats.json')
-    
-    if not os.path.exists(stats_file):
-        logging.warning(f"Feature statistics file {stats_file} not found.")
-        stats = None
-    else:
-        with open(stats_file, 'r') as f:
+    # Load normalization stats
+    if 'features_stats_json' in params and os.path.exists(params['features_stats_json']):
+        import json
+        with open(params['features_stats_json'], 'r') as f:
             stats = json.load(f)
-            means = torch.tensor(stats['means'], dtype=torch.float32)
-            variances = torch.tensor(stats['variances'], dtype=torch.float32)
-            stats = {'means': means, 'variances': variances}
+        means = torch.tensor(stats['means'], dtype=torch.float32)
+        variances = torch.tensor(stats['variances'], dtype=torch.float32)
+    else:
+        logging.warning("No feature statistics found. Using zeros for means and ones for variances.")
+        means = torch.zeros(len(params['feature_columns']), dtype=torch.float32)
+        variances = torch.ones(len(params['feature_columns']), dtype=torch.float32)
     
-    # Create dataset
-    dataset = ParquetSequenceDataset(
-        parquet_path=data_path,
-        feature_columns=config['feature_columns'],
-        seq_len=config['seq_len'],
-        stride=config.get('inference_stride', config['seq_len']),
-        ratio=1.0,
-        seed=config.get('seed', 42),
+    # Create test dataset
+    test_dataset = SequenceStateCacheDataset(
+        parquet_path=test_data_path,
+        feature_columns=params['feature_columns'],
+        seq_len=params['seq_len'],
+        stride=params.get('stride', None),
+        ratio=1.0,  # Use all test data
+        seed=params['seed'],
         skip_anomalies=False,
-        normalization_stats=stats
+        normalization_stats={'means': means, 'variances': variances},
+        use_state_cache=params.get('use_state_cache', True),
+        overlap_ratio=params.get('overlap_ratio', 0.5)
     )
     
     # Create dataloader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.get('inference_batch_size', 32),
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=params['batch_size'],
         shuffle=False,
-        collate_fn=custom_collate_fn
+        collate_fn=custom_collate_fn,
+        num_workers=params.get('num_workers', 4),
+        pin_memory=True
     )
     
-    # Run inference
-    results = {'timestamps': [], 'predictions': [], 'confidence': [], 'reconstruction_error': []}
-    
+    # Set model to evaluation mode
     model.eval()
+    
+    # Create dictionaries to store predictions by timestamp
+    pred_labels_by_ts = {}
+    anomaly_scores_by_ts = {}
+    anomaly_probs_by_ts = {}
+    
+    # Inference loop
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Running inference", unit="batch"):
+        for batch in tqdm(test_loader, desc="Inference", unit="batch"):
             features = batch['features'].to(device)
-            timestamps = batch['timestamps']
+            timestamps = batch['timestamps']  # List of lists of timestamps
             
-            # Get model outputs
+            # Get model predictions and anomaly scores
             class_logits = model(features)
             
-            # Get predictions and confidence
-            probs = torch.softmax(class_logits, dim=-1)
-            preds = torch.argmax(class_logits, dim=-1)
-            confidence, _ = torch.max(probs, dim=-1)
+            # For anomaly score, use the get_anomaly_score method if available
+            if hasattr(model, 'get_anomaly_score'):
+                anomaly_scores, _ = model.get_anomaly_score(features)
+                anomaly_scores = anomaly_scores.cpu()
+            else:
+                # Otherwise, use the negative probability of the normal class
+                class_probs = F.softmax(class_logits, dim=-1)
+                anomaly_scores = -torch.log(class_probs[:, :, 0] + EPS).cpu()
             
-            # Get reconstruction error (if available)
-            try:
-                embedded = model.feature_embedding(features)
-                reconstructed, _ = model.autoencoder(embedded)
-                recon_error = torch.mean(torch.abs(embedded - reconstructed), dim=-1)
-            except:
-                recon_error = torch.zeros_like(preds, dtype=torch.float32)
+            # Get class predictions
+            pred_labels = torch.argmax(class_logits, dim=-1).cpu()
             
-            # Store results
-            for ts_list, pred_list, conf_list, err_list in zip(
-                timestamps, preds.cpu(), confidence.cpu(), recon_error.cpu()
-            ):
-                for ts, pred, conf, err in zip(ts_list, pred_list, conf_list, err_list):
-                    if ts:  # Skip empty timestamps (padding)
-                        results['timestamps'].append(ts)
-                        results['predictions'].append(pred.item())
-                        results['confidence'].append(conf.item())
-                        results['reconstruction_error'].append(err.item())
+            # Calculate probability of being an anomaly (any non-zero class)
+            class_probs = F.softmax(class_logits, dim=-1)
+            normal_probs = class_probs[:, :, 0]
+            anomaly_probs = 1.0 - normal_probs
+            
+            # Store predictions by timestamp
+            for b in range(len(timestamps)):
+                for t in range(len(timestamps[b])):
+                    ts = timestamps[b][t]
+                    pred_labels_by_ts[ts] = pred_labels[b, t].item()
+                    anomaly_scores_by_ts[ts] = anomaly_scores[b, t].item()
+                    anomaly_probs_by_ts[ts] = anomaly_probs[b, t].cpu().item()
     
-    # Map predictions to anomaly names
-    anomaly_mapping = {
-        0: "normal",
-        1: "unnecessary_retx",
-        2: "missing_retx",
-        3: "new_data_no_retx",
-        4: "max_retx_achieved",
-        5: "none_of_them"
-    }
+    # Load original test data to add predictions
+    test_df = pd.read_parquet(test_data_path)
     
-    results['prediction_names'] = [anomaly_mapping.get(p, f"unknown_{p}") for p in results['predictions']]
+    # Map timestamp strings to rows
+    if 'timestamp_str' in test_df.columns:
+        ts_column = 'timestamp_str'
+    else:
+        logging.warning("No timestamp_str column found. Creating a synthetic one.")
+        test_df['timestamp_str'] = [f"ts_{i}" for i in range(len(test_df))]
+        ts_column = 'timestamp_str'
     
-    # Save results if output path provided
-    if output_path:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # Create DataFrame
-        df = pd.DataFrame({
-            'timestamp': results['timestamps'],
-            'prediction': results['predictions'],
-            'prediction_name': results['prediction_names'],
-            'confidence': results['confidence'],
-            'reconstruction_error': results['reconstruction_error']
-        })
-        
-        # Save to CSV
-        df.to_csv(output_path, index=False)
-        logging.info(f"Results saved to {output_path}")
-        
-        # Generate summary
-        summary = df['prediction_name'].value_counts().to_dict()
-        
-        # Log summary
-        logging.info("Inference summary:")
-        for name, count in summary.items():
-            logging.info(f"  {name}: {count}")
+    # Create reverse mapping from anomaly class to label
+    anomaly_mapping = {v: k for k, v in test_dataset.anomaly_mapping.items()}
+    anomaly_mapping[0] = "normal"
     
-    return results
+    # Add predictions to dataframe
+    test_df['predicted_label'] = test_df[ts_column].map(
+        lambda ts: pred_labels_by_ts.get(ts, 0))
+    
+    test_df['predicted_anomaly'] = test_df['predicted_label'].map(
+        lambda label: anomaly_mapping.get(label, "unknown"))
+    
+    test_df['anomaly_score'] = test_df[ts_column].map(
+        lambda ts: anomaly_scores_by_ts.get(ts, 0.0))
+    
+    test_df['anomaly_probability'] = test_df[ts_column].map(
+        lambda ts: anomaly_probs_by_ts.get(ts, 0.0))
+    
+    # Add flag for any anomaly
+    test_df['is_anomaly'] = test_df['predicted_label'] > 0
+    
+    # Log summary of predictions
+    anomaly_counts = test_df['predicted_anomaly'].value_counts()
+    logging.info("Prediction summary:")
+    for anomaly_type, count in anomaly_counts.items():
+        logging.info(f"  {anomaly_type}: {count} instances ({count/len(test_df)*100:.2f}%)")
+    
+    logging.info(f"Total anomalies detected: {test_df['is_anomaly'].sum()} "
+                f"({test_df['is_anomaly'].sum()/len(test_df)*100:.2f}%)")
+    
+    return test_df
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='PDSCH Anomaly Detection Inference')
+def run_inference_with_states(model, test_data_path, params, device):
+    """
+    Run inference on test data with stateful processing for HARQ IDs.
     
-    parser.add_argument('--model', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, help='Path to model configuration')
-    parser.add_argument('--input', type=str, required=True, help='Path to input data file')
-    parser.add_argument('--output', type=str, help='Path to save results')
-    parser.add_argument('--no_cuda', action='store_true', help='Disable CUDA')
-    parser.add_argument('--log_dir', type=str, default='./inference_logs', help='Log directory')
+    This version maintains state between non-overlapping chunks of data
+    for better handling of temporal dependencies.
     
-    return parser.parse_args()
-
-def main():
-    """Main entry point"""
-    # Parse arguments
-    args = parse_arguments()
+    Args:
+        model: Trained model
+        test_data_path: Path to test data parquet file
+        params: Dictionary of parameters
+        device: Device to run inference on
+        
+    Returns:
+        DataFrame with original data and anomaly predictions
+    """
+    logging.info(f"Running stateful inference on {test_data_path}")
     
-    # Setup logging
-    os.makedirs(args.log_dir, exist_ok=True)
-    logging.basicConfig(
-        filename=os.path.join(args.log_dir, 'inference.log'),
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        filemode='w'
-    )
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    console.setFormatter(formatter)
-    logging.getLogger('').addHandler(console)
+    # Load normalization stats
+    if 'features_stats_json' in params and os.path.exists(params['features_stats_json']):
+        import json
+        with open(params['features_stats_json'], 'r') as f:
+            stats = json.load(f)
+        means = torch.tensor(stats['means'], dtype=torch.float32)
+        variances = torch.tensor(stats['variances'], dtype=torch.float32)
+    else:
+        logging.warning("No feature statistics found. Using zeros for means and ones for variances.")
+        means = torch.zeros(len(params['feature_columns']), dtype=torch.float32)
+        variances = torch.ones(len(params['feature_columns']), dtype=torch.float32)
     
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    logging.info(f"Using device: {device}")
+    # Load test data
+    test_df = pd.read_parquet(test_data_path)
     
-    # Load model
-    model, config = load_model(args.model, args.config, device)
-    logging.info(f"Model loaded from {args.model}")
+    # Ensure timestamp column exists
+    if 'timestamp_str' not in test_df.columns:
+        logging.warning("No timestamp_str column found. Creating a synthetic one.")
+        test_df['timestamp_str'] = [f"ts_{i}" for i in range(len(test_df))]
     
-    # Set output path
-    output_path = args.output
-    if output_path is None:
-        output_dir = os.path.join(args.log_dir, 'results')
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, 'predictions.csv')
+    # Track HARQ states
+    harq_states = {}
     
-    # Run inference
-    results = run_inference(model, args.input, config, output_path, device)
+    # Create predictions dataframe
+    predictions = []
     
-    # Print summary
-    anomaly_count = sum(1 for p in results['predictions'] if p > 0)
-    total_count = len(results['predictions'])
-    anomaly_percentage = (anomaly_count / total_count) * 100 if total_count > 0 else 0
+    # Process data in chunks by HARQ ID
+    harq_groups = test_df.groupby('HARQ')
     
-    logging.info(f"Inference complete. Found {anomaly_count} anomalies out of {total_count} instances ({anomaly_percentage:.2f}%)")
+    for harq_id, group in tqdm(harq_groups, desc="Processing HARQ groups"):
+        # Extract features
+        features = torch.tensor(group[params['feature_columns']].values, dtype=torch.float32)
+        
+        # Normalize features
+        std = torch.sqrt(variances + EPS)
+        features = (features - means) / std
+        
+        # Process in chunks of seq_len
+        for start_idx in range(0, len(features), params['seq_len']):
+            end_idx = min(start_idx + params['seq_len'], len(features))
+            chunk_features = features[start_idx:end_idx]
+            
+            # Pad if needed
+            if chunk_features.size(0) < params['seq_len']:
+                padding = torch.zeros(params['seq_len'] - chunk_features.size(0), 
+                                    chunk_features.size(1), 
+                                    dtype=chunk_features.dtype)
+                chunk_features = torch.cat([chunk_features, padding], dim=0)
+            
+            # Add batch dimension
+            chunk_features = chunk_features.unsqueeze(0).to(device)
+            
+            # Get initial state for this HARQ ID if available
+            prev_state = harq_states.get(harq_id, None)
+            
+            # Forward pass with state tracking
+            with torch.no_grad():
+                if hasattr(model, 'inference') and callable(model.inference):
+                    # Use stateful inference if available
+                    output, new_state = model.inference(chunk_features, prev_state)
+                    class_logits = output
+                else:
+                    # Fallback to standard forward pass
+                    class_logits = model(chunk_features)
+                    new_state = None
+            
+            # Update state
+            if new_state is not None:
+                harq_states[harq_id] = new_state
+            
+            # Get predictions
+            pred_labels = torch.argmax(class_logits, dim=-1).cpu().numpy()[0]
+            class_probs = F.softmax(class_logits, dim=-1).cpu().numpy()[0]
+            
+            # Store predictions only for actual data (not padding)
+            actual_length = min(params['seq_len'], end_idx - start_idx)
+            chunk_indices = group.iloc[start_idx:end_idx].index
+            
+            for i, idx in enumerate(chunk_indices):
+                if i >= actual_length:
+                    break
+                    
+                predictions.append({
+                    'index': idx,
+                    'predicted_label': pred_labels[i],
+                    'normal_prob': class_probs[i, 0],
+                    'anomaly_prob': 1.0 - class_probs[i, 0]
+                })
     
-    return 0
-
-if __name__ == "__main__":
-    main()
+    # Convert predictions to dataframe and merge with test data
+    pred_df = pd.DataFrame(predictions)
+    pred_df.set_index('index', inplace=True)
+    
+    # Merge with original data
+    result_df = test_df.copy()
+    result_df = result_df.join(pred_df, how='left')
+    
+    # Fill missing predictions (if any)
+    result_df['predicted_label'] = result_df['predicted_label'].fillna(0).astype(int)
+    result_df['normal_prob'] = result_df['normal_prob'].fillna(1.0)
+    result_df['anomaly_prob'] = result_df['anomaly_prob'].fillna(0.0)
+    
+    # Create anomaly type mapping
+    anomaly_mapping = {0: "normal"}
+    for anomaly_name, anomaly_id in test_dataset.anomaly_mapping.items():
+        anomaly_mapping[anomaly_id] = anomaly_name
+    
+    # Add predicted anomaly type
+    result_df['predicted_anomaly'] = result_df['predicted_label'].map(
+        lambda x: anomaly_mapping.get(x, "unknown"))
+    
+    # Add anomaly score (negative log probability of normal class)
+    result_df['anomaly_score'] = -np.log(result_df['normal_prob'] + EPS)
+    
+    # Add flag for any anomaly
+    result_df['is_anomaly'] = result_df['predicted_label'] > 0
+    
+    # Log summary of predictions
+    anomaly_counts = result_df['predicted_anomaly'].value_counts()
+    logging.info("Prediction summary:")
+    for anomaly_type, count in anomaly_counts.items():
+        logging.info(f"  {anomaly_type}: {count} instances ({count/len(result_df)*100:.2f}%)")
+    
+    logging.info(f"Total anomalies detected: {result_df['is_anomaly'].sum()} "
+                f"({result_df['is_anomaly'].sum()/len(result_df)*100:.2f}%)")
+    
+    return result_df

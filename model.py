@@ -3,565 +3,455 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+from torch.autograd import Variable
 
-class WeightedFocalLoss(nn.Module):
-    def __init__(self, weights=None, gamma=2.0, alpha=0.25, reduction='mean'):
-        """
-        Weighted Focal Loss for handling class imbalance in classification.
-        
-        Args:
-            weights: Class weights tensor [num_classes]
-            gamma: Focusing parameter for hard examples (higher value = more focus)
-            alpha: Weighting factor for positive vs negative examples
-            reduction: 'mean', 'sum', or 'none'
-        """
-        super(WeightedFocalLoss, self).__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.reduction = reduction
-        self.weights = weights
-    
-    def forward(self, inputs, targets):
-        """
-        Args:
-            inputs: Predicted logits [batch_size, seq_len, num_classes] or [batch_size*seq_len, num_classes]
-            targets: Target labels [batch_size, seq_len] or [batch_size*seq_len]
-        """
-        # Handle different input shapes
-        if inputs.dim() == 3:
-            batch_size, seq_len, num_classes = inputs.shape
-            inputs = inputs.reshape(-1, num_classes)
-            targets = targets.reshape(-1)
-        
-        # Filter out ignored indices
-        valid_mask = targets >= 0
-        inputs = inputs[valid_mask]
-        targets = targets[valid_mask]
-        
-        if len(targets) == 0:
-            return torch.tensor(0.0, device=inputs.device, requires_grad=True)
-        
-        # Apply weights if provided
-        if self.weights is not None:
-            weights = self.weights.to(inputs.device)
-            weights = weights[targets]
-        else:
-            weights = torch.ones_like(targets, device=inputs.device, dtype=torch.float32)
-        
-        # Compute softmax probabilities
-        log_probs = F.log_softmax(inputs, dim=-1)
-        probs = torch.exp(log_probs)
-        
-        # Get probability for target class
-        target_probs = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        
-        # Compute focal weight term
-        focal_weight = (1 - target_probs) ** self.gamma
-        
-        # Apply alpha weighting for positive/negative examples
-        alpha_weight = torch.ones_like(targets, device=inputs.device, dtype=torch.float32)
-        alpha_weight[targets > 0] = self.alpha  # Anomaly classes
-        alpha_weight[targets == 0] = 1 - self.alpha  # Normal class
-        
-        # Compute final loss
-        loss = -weights * alpha_weight * focal_weight * log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        
-        # Apply reduction
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:  # 'none'
-            return loss
+# Constants
+EPS = 1e-8
 
+# Update in the FeatureEmbedding class in model.py
 
 class FeatureEmbedding(nn.Module):
     """
-    Hybrid feature embedding layer that handles both categorical and numerical features.
+    Embeds categorical features into continuous space with safety checks
     """
-    def __init__(self, feature_ranges, embedding_dims=None):
-        """
-        Args:
-            feature_ranges: List of max values for each feature
-            embedding_dims: Optional list of embedding dimensions for categorical features
-        """
-        super(FeatureEmbedding, self).__init__()
+    def __init__(self, feature_ranges, embedding_dim=8):
+        super().__init__()
         self.feature_ranges = feature_ranges
-        
-        # Define which features are categorical vs numerical
-        # For PDSCH data: [SFN, Slot, HARQ, MCS, CRC, ReTx, NDI]
-        self.categorical_indices = [2, 4, 6]  # HARQ, CRC, NDI
-        self.numerical_indices = [0, 1, 3, 5]  # SFN, Slot, MCS, ReTx
-        
-        # Determine embedding dimensions if not provided
-        if embedding_dims is None:
-            self.embedding_dims = []
-            for i, range_val in enumerate(feature_ranges):
-                if i in self.categorical_indices:
-                    # Rule of thumb: min(50, (cardinality+1)//2)
-                    dim = min(50, (range_val + 2) // 2)
-                    self.embedding_dims.append(dim)
-                else:
-                    self.embedding_dims.append(1)  # Numerical features stay 1D
-        else:
-            self.embedding_dims = embedding_dims
-        
-        # Create embeddings for categorical features
         self.embeddings = nn.ModuleList([
-            nn.Embedding(range_val + 1, self.embedding_dims[i])
-            for i, range_val in enumerate(feature_ranges)
-            if i in self.categorical_indices
+            nn.Embedding(range_size + 1, min(embedding_dim, (range_size + 1) // 2 + 1))
+            for range_size in feature_ranges
         ])
+        self.output_dim = sum(min(embedding_dim, (range_size + 1) // 2 + 1) for range_size in feature_ranges)
         
-        # Track embedding index mapping
-        self.embedding_map = {idx: i for i, idx in enumerate(self.categorical_indices)}
-        
-        # Calculate total dimension after embedding
-        self.output_dim = sum(self.embedding_dims[i] if i in self.categorical_indices 
-                              else 1 for i in range(len(feature_ranges)))
-    
     def forward(self, x):
-        """
-        Args:
-            x: Input features [batch_size, seq_len, num_features]
+        # x shape: [B, T, F]
+        B, T, F = x.shape
         
-        Returns:
-            embedded: Combined embedded features [batch_size, seq_len, output_dim]
-        """
-        batch_size, seq_len, num_features = x.shape
+        # Ensure x is of integer type
+        x = x.long()
         
-        # Process features
-        embeddings = []
-        
-        for i in range(num_features):
-            if i in self.categorical_indices:
-                # Get feature values and ensure they're valid indices
-                feature_vals = torch.clamp(x[:, :, i].long(), 0, self.feature_ranges[i])
-                # Apply embedding
-                embedded = self.embeddings[self.embedding_map[i]](feature_vals)
-                embeddings.append(embedded)
-            else:
-                # Normalize numerical features
-                normalized = (x[:, :, i] / self.feature_ranges[i]).unsqueeze(-1)
-                embeddings.append(normalized)
-        
-        # Concatenate all features
-        return torch.cat(embeddings, dim=-1)
+        # Apply embeddings for each feature with safety checks
+        embedded_features = []
+        for i, embedding in enumerate(self.embeddings):
+            feature_values = x[:, :, i]
+            
+            # Safety check: clamp values to valid range for this feature
+            max_valid_index = self.feature_ranges[i]
+            feature_values = torch.clamp(feature_values, 0, max_valid_index)
+            
+            # Get embedding
+            embedded = embedding(feature_values)  # [B, T, embedding_dim]
+            embedded_features.append(embedded)
+            
+        # Concatenate all embedded features
+        return torch.cat(embedded_features, dim=2)  # [B, T, sum(embedding_dims)]
 
 
 class PositionalEncoding(nn.Module):
     """
-    Adds positional encoding to input sequences to provide sequence order information.
+    Adds positional encoding to the input embeddings
     """
-    def __init__(self, d_model, max_seq_len=200, dropout=0.1):
-        """
-        Args:
-            d_model: Dimension of the input embeddings
-            max_seq_len: Maximum sequence length
-            dropout: Dropout probability
-        """
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        
-        # Create positional encoding matrix
+    def __init__(self, d_model, max_seq_len=200):
+        super().__init__()
         pe = torch.zeros(max_seq_len, d_model)
         position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
         
-        # Apply sinusoidal positional encoding
+        # Calculate positions
+        even_i = torch.arange(0, d_model, 2)
+        div_term = torch.exp(even_i.float() * (-math.log(10000.0) / d_model))
+        
+        # Apply sine to even positions
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Apply cosine to odd positions that exist
+        odd_i = torch.arange(1, d_model, 2)
+        if len(odd_i) > 0:
+            pe[:, odd_i] = torch.cos(position * div_term[:len(odd_i)])
+        
         pe = pe.unsqueeze(0)
-        
-        # Register buffer (persistent state)
         self.register_buffer('pe', pe)
-    
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor [batch_size, seq_len, d_model]
-        
-        Returns:
-            Output with positional encoding added
-        """
-        # Add positional encoding and apply dropout
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
-
-
-class TemporalAttention(nn.Module):
-    """
-    Self-attention module for capturing temporal dependencies
-    """
-    def __init__(self, input_dim, dropout=0.1):
-        super(TemporalAttention, self).__init__()
-        self.query = nn.Linear(input_dim, input_dim)
-        self.key = nn.Linear(input_dim, input_dim)
-        self.value = nn.Linear(input_dim, input_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.scale = torch.sqrt(torch.tensor(input_dim, dtype=torch.float32))
         
     def forward(self, x):
-        """
-        Args:
-            x: Input tensor [batch_size, seq_len, input_dim]
-        
-        Returns:
-            attention_output: Attended features [batch_size, seq_len, input_dim]
-        """
-        # Compute query, key, value projections
-        query = self.query(x)  # [batch_size, seq_len, input_dim]
-        key = self.key(x)      # [batch_size, seq_len, input_dim]
-        value = self.value(x)  # [batch_size, seq_len, input_dim]
-        
-        # Compute attention scores
-        scores = torch.matmul(query, key.transpose(-2, -1)) / self.scale  # [batch_size, seq_len, seq_len]
-        
-        # Apply softmax to get attention weights
-        attention_weights = F.softmax(scores, dim=-1)
-        attention_weights = self.dropout(attention_weights)
-        
-        # Apply attention weights to values
-        attention_output = torch.matmul(attention_weights, value)  # [batch_size, seq_len, input_dim]
-        
-        return attention_output
+        # x shape: [B, T, d_model]
+        return x + self.pe[:, :x.size(1), :]
 
 
-class SequentialAutoencoder(nn.Module):
+class AutoregressiveTemporalBlock(nn.Module):
     """
-    Autoencoder for sequential anomaly detection that preserves temporal dependencies.
-    Only trained on normal data.
+    Processes temporal data with bidirectional LSTM and self-attention
     """
-    def __init__(self, input_dim, hidden_dim, latent_dim, num_layers=2, dropout=0.1):
-        """
-        Args:
-            input_dim: Input feature dimension after embedding
-            hidden_dim: Hidden dimension size
-            latent_dim: Latent space dimension
-            num_layers: Number of LSTM layers
-            dropout: Dropout probability
-        """
-        super(SequentialAutoencoder, self).__init__()
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_dim, 
+            hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim * 2,  # bidirectional
+            num_heads=4,
+            dropout=dropout
+        )
+        self.norm1 = nn.LayerNorm(hidden_dim * 2)
+        self.norm2 = nn.LayerNorm(hidden_dim * 2)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2)
+        )
+        self.output_dim = hidden_dim * 2
         
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
+    def forward(self, x, prev_state=None):
+        # x shape: [B, T, input_dim]
         
-        # Positional encoding for sequential information
-        self.positional_encoding = PositionalEncoding(input_dim, dropout=dropout)
+        # LSTM processing
+        if prev_state is not None:
+            output, state = self.lstm(x, prev_state)
+        else:
+            output, state = self.lstm(x)
         
-        # Encoder network (bidirectional LSTM)
+        # Self-attention
+        attn_output, _ = self.attention(
+            output.transpose(0, 1),  # [T, B, hidden_dim*2]
+            output.transpose(0, 1),
+            output.transpose(0, 1)
+        )
+        attn_output = attn_output.transpose(0, 1)  # [B, T, hidden_dim*2]
+        
+        # Residual connection and normalization
+        output = self.norm1(output + attn_output)
+        
+        # Feed-forward network
+        ff_output = self.ff(output)
+        output = self.norm2(output + ff_output)
+        
+        return output, state
+
+
+class TemporalVAE(nn.Module):
+    """
+    Variational Autoencoder with temporal components for representation learning
+    """
+    def __init__(self, input_dim, hidden_dim=64, latent_dim=32, num_layers=2, dropout=0.2):
+        super().__init__()
+        
+        # Encoder
         self.encoder_lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
+            input_dim,
+            hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=True
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
         )
         
-        # Attention mechanism to maintain temporal dependencies
-        self.attention = TemporalAttention(hidden_dim * 2, dropout=dropout)
+        # Latent space projections
+        self.mu_proj = nn.Linear(hidden_dim * 2, latent_dim)
+        self.logvar_proj = nn.Linear(hidden_dim * 2, latent_dim)
         
-        # Projection to latent space
-        self.to_latent = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, latent_dim)
-        )
-        
-        # Decoder network
-        self.from_latent = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim * 2)
-        )
-        
+        # Decoder
+        self.latent_to_hidden = nn.Linear(latent_dim, hidden_dim * 2)
         self.decoder_lstm = nn.LSTM(
-            input_size=hidden_dim * 2,
-            hidden_size=hidden_dim,
+            hidden_dim * 2,
+            hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=True
+            dropout=dropout if num_layers > 1 else 0
         )
+        self.output_proj = nn.Linear(hidden_dim, input_dim)
         
-        # Output projection
-        self.output_proj = nn.Linear(hidden_dim * 2, input_dim)
-    
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        
     def encode(self, x):
-        """
-        Encode input features to latent representation
+        # x shape: [B, T, input_dim]
+        output, (h_n, _) = self.encoder_lstm(x)
         
-        Args:
-            x: Input features [batch_size, seq_len, input_dim]
-        
-        Returns:
-            z: Latent representation [batch_size, seq_len, latent_dim]
-        """
-        # Add positional encoding
-        x = self.positional_encoding(x)
-        
-        # Encode with LSTM
-        encoder_output, _ = self.encoder_lstm(x)
-        
-        # Apply attention to capture temporal dependencies
-        attended = self.attention(encoder_output)
+        # Use the hidden state from the last layer
+        h_n = torch.cat([h_n[-2], h_n[-1]], dim=1)  # Concatenate forward and backward
         
         # Project to latent space
-        z = self.to_latent(attended)
+        mu = self.mu_proj(h_n)
+        logvar = self.logvar_proj(h_n)
         
-        return z
+        return mu, logvar
     
-    def decode(self, z):
-        """
-        Decode latent representation back to input space
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z, seq_len):
+        # z shape: [B, latent_dim]
+        hidden = self.latent_to_hidden(z)
         
-        Args:
-            z: Latent representation [batch_size, seq_len, latent_dim]
+        # Repeat for sequence length
+        hidden = hidden.unsqueeze(1).repeat(1, seq_len, 1)  # [B, T, hidden_dim*2]
         
-        Returns:
-            reconstruction: Reconstructed features [batch_size, seq_len, input_dim]
-        """
-        # Project from latent space
-        h = self.from_latent(z)
-        
-        # Decode with LSTM
-        decoder_output, _ = self.decoder_lstm(h)
-        
-        # Project to output space
-        reconstruction = self.output_proj(decoder_output)
+        # Decode
+        output, _ = self.decoder_lstm(hidden)
+        reconstruction = self.output_proj(output)
         
         return reconstruction
     
     def forward(self, x):
-        """
-        Forward pass through the autoencoder
+        # x shape: [B, T, input_dim]
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        reconstruction = self.decode(z, x.size(1))
         
-        Args:
-            x: Input features [batch_size, seq_len, input_dim]
-        
-        Returns:
-            reconstruction: Reconstructed features [batch_size, seq_len, input_dim]
-            z: Latent representation [batch_size, seq_len, latent_dim]
-        """
-        # Encode
-        z = self.encode(x)
-        
-        # Decode
-        reconstruction = self.decode(z)
-        
-        return reconstruction, z
+        return reconstruction, mu, logvar, z
 
 
-class HierarchicalClassifier(nn.Module):
+class AnomalyClassifier(nn.Module):
     """
-    Classifier for telecommunication anomaly detection that directly classifies instances
-    into normal or specific anomaly types.
+    Classifier for anomaly detection that uses both raw features and VAE embeddings
     """
-    def __init__(self, input_dim, hidden_dim, num_anomaly_classes=5, dropout=0.1):
-        """
-        Args:
-            input_dim: Input feature dimension (original + reconstructed + errors)
-            hidden_dim: Hidden dimension size
-            num_anomaly_classes: Number of anomaly classes (including "none of them")
-            dropout: Dropout probability
-        """
-        super(HierarchicalClassifier, self).__init__()
+    def __init__(self, input_dim, vae_latent_dim, hidden_dim=64, num_classes=5, num_layers=1, dropout=0.2):
+        super().__init__()
         
-        # Number of anomaly classes + 1 for normal
-        self.num_classes = num_anomaly_classes + 1
+        # Combine raw features and VAE embeddings
+        combined_dim = input_dim + vae_latent_dim
         
-        # Positional encoding
-        self.positional_encoding = PositionalEncoding(input_dim, dropout=dropout)
-        
-        # Feature extraction network
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
+        # Temporal processing
+        self.temporal_block = AutoregressiveTemporalBlock(
+            combined_dim, 
+            hidden_dim, 
+            num_layers,
+            dropout
         )
         
-        # Bidirectional LSTM for sequence modeling
-        self.lstm = nn.LSTM(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=True
-        )
-        
-        # Attention mechanism to focus on important parts of the sequence
-        self.attention = TemporalAttention(hidden_dim * 2, dropout=dropout)
-        
-        # Direct classification head for all classes
+        # Classification head
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
+            nn.Linear(self.temporal_block.output_dim, hidden_dim),
+            nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.num_classes)
+            nn.Linear(hidden_dim, num_classes)
         )
-    
-    def forward(self, x):
-        """
-        Forward pass through the classifier
         
-        Args:
-            x: Input features [batch_size, seq_len, input_dim]
-                (combined original, reconstructed, and errors)
+    def forward(self, x, vae_embedding):
+        # x shape: [B, T, input_dim]
+        # vae_embedding shape: [B, vae_latent_dim]
         
-        Returns:
-            logits: Classification logits [batch_size, seq_len, num_classes]
-        """
-        # Add positional encoding
-        x = self.positional_encoding(x)
+        # Repeat VAE embedding for each time step and concatenate with input
+        B, T, _ = x.shape
+        vae_embedding = vae_embedding.unsqueeze(1).repeat(1, T, 1)  # [B, T, vae_latent_dim]
+        combined = torch.cat([x, vae_embedding], dim=2)  # [B, T, input_dim + vae_latent_dim]
         
-        # Extract features
-        features = self.feature_extractor(x)
+        # Process with temporal block
+        output, _ = self.temporal_block(combined)
         
-        # Apply LSTM
-        lstm_out, _ = self.lstm(features)
-        
-        # Apply attention to focus on relevant parts of the sequence
-        attended = self.attention(lstm_out)
-        
-        # Direct classification into all classes
-        logits = self.classifier(attended)
+        # Classify each time step
+        logits = self.classifier(output)  # [B, T, num_classes]
         
         return logits
-
+        
 
 class TwoPhaseModel(nn.Module):
     """
-    Complete two-phase model with autoencoder and hierarchical classifier.
+    Two-phase model combining VAE representation learning and supervised classification
     """
-    def __init__(self, feature_ranges, params=None):
-        """
-        Args:
-            feature_ranges: List of max values for each feature
-            params: Dictionary of model parameters
-        """
-        super(TwoPhaseModel, self).__init__()
+    def __init__(self, feature_ranges, embedding_dim=8, hidden_dim=64, 
+                 latent_dim=32, num_classes=5, num_layers=2, dropout=0.2,
+                 alpha=0.5, gamma=2.0, class_weights=None, beta=0.1):
+        super().__init__()
         
-        # Set default parameters if not provided
-        if params is None:
-            params = {}
+        # Phase 1: Feature embedding and representation learning
+        self.feature_embedding = FeatureEmbedding(feature_ranges, embedding_dim)
+        self.positional_encoding = PositionalEncoding(self.feature_embedding.output_dim)
         
-        # Extract parameters with defaults
-        embedding_dim = params.get('embedding_dim', 16)
-        hidden_dim = params.get('hidden_dim', 64)
-        latent_dim = params.get('latent_dim', 32)
-        dropout = params.get('dropout', 0.2)
-        num_anomaly_classes = params.get('num_anomaly_classes', 5)  # 4 anomaly types + "none of them"
-        
-        # Feature embedding layer
-        self.feature_embedding = FeatureEmbedding(
-            feature_ranges, 
-            embedding_dims=[embedding_dim] * len(feature_ranges)
-        )
-        embedded_dim = self.feature_embedding.output_dim
-        
-        # Autoencoder for reconstruction
-        self.autoencoder = SequentialAutoencoder(
-            input_dim=embedded_dim,
+        self.vae = TemporalVAE(
+            input_dim=self.feature_embedding.output_dim,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
+            num_layers=num_layers,
             dropout=dropout
         )
         
-        # Combined feature dimension for classifier (original + reconstructed + errors)
-        classifier_input_dim = embedded_dim * 3
-        
-        # Hierarchical classifier
-        self.classifier = HierarchicalClassifier(
-            input_dim=classifier_input_dim,
+        # Phase 2: Anomaly classification
+        self.classifier = AnomalyClassifier(
+            input_dim=self.feature_embedding.output_dim,
+            vae_latent_dim=latent_dim,
             hidden_dim=hidden_dim,
-            num_anomaly_classes=num_anomaly_classes,
+            num_classes=num_classes,
+            num_layers=num_layers,
             dropout=dropout
         )
         
-        # Track which phase is being trained
-        self.train_autoencoder = True
-        self.train_classifier = False
-    
-    def get_loss_weights(self, class_counts):
-        """
-        Compute class weights based on inverse frequency
+        # Parameters for Focal Loss
+        self.alpha = alpha
+        self.gamma = gamma
+        self.class_weights = class_weights
+        self.beta = beta  # Weight for VAE loss versus classification loss
         
-        Args:
-            class_counts: Dictionary mapping class indices to counts
-        
-        Returns:
-            weights: Class weights tensor
-        """
-        total = sum(class_counts.values())
-        # Compute inverse frequency and normalize
-        weights = torch.zeros(len(class_counts))
-        for cls, count in class_counts.items():
-            weights[cls] = 1.0 / (count / total)
-        
-        # Normalize weights to sum to len(class_counts)
-        weights = weights * len(class_counts) / weights.sum()
-        return weights
-    
     def forward(self, x, return_latents=False):
-        """
-        Forward pass through the entire model
+        # x shape: [B, T, F]
         
-        Args:
-            x: Input features [batch_size, seq_len, num_features]
-            return_latents: Whether to return latent representations
-        
-        Returns:
-            logits: Classification logits [batch_size, seq_len, num_classes]
-            (optionally) latents: Latent representations
-        """
-        # Embed features
+        # Phase 1: Embedding and VAE
         embedded = self.feature_embedding(x)
+        embedded = self.positional_encoding(embedded)
+        reconstruction, mu, logvar, z = self.vae(embedded)
         
-        # Get reconstruction from autoencoder
-        reconstructed, latents = self.autoencoder(embedded)
-        
-        # Compute reconstruction errors per feature
-        errors = torch.abs(embedded - reconstructed)
-        
-        # Combine original features, reconstructed features, and errors
-        combined_features = torch.cat([embedded, reconstructed, errors], dim=-1)
-        
-        # Get classification logits
-        logits = self.classifier(combined_features)
+        # Phase 2: Classification
+        class_logits = self.classifier(embedded, z)
         
         if return_latents:
-            return logits, latents
+            return class_logits, z
+        return class_logits
+    
+    def compute_vae_loss(self, x, reconstruction, mu, logvar):
+        """
+        Compute VAE loss (reconstruction + KL divergence)
+        """
+        # Reconstruction loss
+        embedded = self.feature_embedding(x)
+        embedded = self.positional_encoding(embedded)
+        recon_loss = F.mse_loss(reconstruction, embedded)
+        
+        # KL divergence
+        kld_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        
+        return recon_loss + kld_loss
+    
+    def compute_classification_loss(self, logits, targets):
+        """
+        Compute focal loss for classification
+        """
+        return self.focal_loss(logits, targets)
+    
+    def focal_loss(self, logits, targets):
+        """
+        Compute the focal loss between logits and targets
+        """
+        # Get weights for each class
+        weights = self.get_loss_weights(None) if self.class_weights is None else self.class_weights
+        weights = weights.to(logits.device)
+        
+        # Reshape for loss calculation
+        B, T, C = logits.shape
+        logits = logits.view(-1, C)  # [B*T, C]
+        targets = targets.view(-1)    # [B*T]
+        
+        # Focal loss calculation
+        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (self.alpha * (1 - pt) ** self.gamma * ce_loss)
+        
+        # Apply class weights
+        class_weights = weights[targets]
+        weighted_focal_loss = focal_loss * class_weights
+        
+        return weighted_focal_loss.mean()
+    
+    def get_loss_weights(self, counts):
+        """
+        Compute class weights based on class frequencies
+        """
+        if counts is None:
+            # Default weights if counts not provided (equal weighting)
+            return torch.ones(5)
+        
+        # Convert counts to tensor if it's a dictionary
+        if isinstance(counts, dict):
+            count_tensor = torch.zeros(len(counts))
+            for class_id, count in counts.items():
+                count_tensor[class_id] = count
+            counts = count_tensor
+        
+        # Calculate inverse frequency weights and normalize
+        total_samples = torch.sum(counts)
+        class_weights = total_samples / (counts * len(counts) + EPS)
+        
+        # Normalize weights to sum to number of classes
+        class_weights = class_weights * len(counts) / torch.sum(class_weights)
+        return class_weights
+    
+    def inference(self, x, prev_states=None):
+        """
+        Forward pass with state tracking for inference over longer sequences
+        """
+        # Embedding
+        embedded = self.feature_embedding(x)
+        embedded = self.positional_encoding(embedded)
+        
+        # VAE encoding
+        mu, logvar = self.vae.encode(embedded)
+        z = self.vae.reparameterize(mu, logvar)
+        
+        # Classification with previous state if available
+        if prev_states is not None:
+            combined = torch.cat([embedded, z.unsqueeze(1).repeat(1, embedded.size(1), 1)], dim=2)
+            output, new_states = self.temporal_block(combined, prev_states)
+            logits = self.classifier(output)
+            return logits, new_states
         else:
-            return logits
-    
-    def freeze_autoencoder(self):
-        """Freeze autoencoder parameters for classifier training phase"""
-        for param in self.autoencoder.parameters():
-            param.requires_grad = False
-        self.train_autoencoder = False
-        self.train_classifier = True
-    
-    def freeze_classifier(self):
-        """Freeze classifier parameters for autoencoder training phase"""
-        for param in self.classifier.parameters():
-            param.requires_grad = False
-        self.train_autoencoder = True
-        self.train_classifier = False
-    
-    def unfreeze_all(self):
-        """Unfreeze all parameters for fine-tuning"""
-        for param in self.parameters():
-            param.requires_grad = True
-        self.train_autoencoder = True
-        self.train_classifier = True
+            # Standard forward pass
+            return self.forward(x), None
+
+    def get_anomaly_score(self, x):
+        """
+        Compute anomaly score based on reconstruction error and classification
+        """
+        # Get embeddings
+        embedded = self.feature_embedding(x)
+        embedded = self.positional_encoding(embedded)
+        
+        # VAE reconstruction
+        reconstruction, mu, logvar, z = self.vae(embedded)
+        
+        # Reconstruction error as anomaly signal
+        recon_error = F.mse_loss(reconstruction, embedded, reduction='none')
+        recon_error = recon_error.mean(dim=2)  # Average across feature dimension
+        
+        # Classification probabilities
+        class_logits = self.classifier(embedded, z)
+        class_probs = F.softmax(class_logits, dim=2)
+        
+        # Probability of normal class (class 0)
+        normal_probs = class_probs[:, :, 0]
+        
+        # Combined anomaly score: high reconstruction error or low normal probability
+        combined_score = recon_error - torch.log(normal_probs + EPS)
+        
+        return combined_score, class_logits
+
+
+class WeightedFocalLoss(nn.Module):
+    """
+    Focal loss with adjustable alpha and gamma parameters
+    """
+    def __init__(self, weights=None, alpha=0.5, gamma=2.0):
+        super().__init__()
+        self.weights = weights
+        self.alpha = alpha
+        self.gamma = gamma
+        
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: [B, T, C] logits
+            targets: [B, T] class indices
+        """
+        # Reshape inputs and targets
+        B, T, C = inputs.shape
+        inputs = inputs.view(-1, C)  # [B*T, C]
+        targets = targets.view(-1)    # [B*T]
+        
+        # Cross entropy loss
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        
+        # Focal loss calculation
+        pt = torch.exp(-ce_loss)
+        focal_loss = (self.alpha * (1 - pt) ** self.gamma * ce_loss)
+        
+        # Apply class weights if provided
+        if self.weights is not None:
+            weights = self.weights.to(focal_loss.device)
+            class_weights = weights[targets]
+            focal_loss = focal_loss * class_weights
+        
+        return focal_loss.mean()

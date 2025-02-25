@@ -7,64 +7,45 @@ import torch.nn as nn
 import json
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from sklearn.metrics import confusion_matrix, f1_score, precision_recall_fscore_support
-import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import pandas as pd
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+import seaborn as sns
+from collections import defaultdict
+import torch.nn.functional as F
 
-EPS = 1e-8  # Small constant to avoid division by zero
+# Constants
+EPS = 1e-8
 
 def start_logging(params=None):
     """
-    Set up logging to both file and console
-    
-    Args:
-        params: Optional parameter dictionary
+    Initialize logging.
     """
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Create output directories
     output_dir = params['output_dir'] if params and 'output_dir' in params else 'output'
     os.makedirs(output_dir, exist_ok=True)
-    
     log_dir = os.path.join(output_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
-    
-    # Set up log file
-    log_file = os.path.join(log_dir, f'training_{current_time}.log')
-    
-    # Configure logging
+    log_file = os.path.join(log_dir, f'log_training_{current_time}.log')
     logging.basicConfig(
         filename=log_file,
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         filemode='w'
     )
-    
-    # Add console handler
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console.setFormatter(formatter)
     logging.getLogger('').addHandler(console)
-    
-    # Log parameters if provided
     if params:
         logging.info("Hyperparameters and settings:")
         for key, value in params.items():
-            if key != 'feature_ranges' and key != 'oversample_factors':
-                logging.info(f"  {key}: {value}")
-            else:
-                # Format these more compactly
-                logging.info(f"  {key}: {value}")
+            logging.info(f"{key}: {value}")
 
 def save_checkpoint(state: dict, filename: str):
     """
-    Save model checkpoint to file
-    
-    Args:
-        state: Dictionary containing model state and metadata
-        filename: File path to save to
+    Save model checkpoint.
     """
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     torch.save(state, filename)
@@ -72,64 +53,26 @@ def save_checkpoint(state: dict, filename: str):
 
 def load_checkpoint(filename: str, model: nn.Module, optimizer: torch.optim.Optimizer):
     """
-    Load model checkpoint from file
-    
-    Args:
-        filename: File path to load from
-        model: Model to load state into
-        optimizer: Optimizer to load state into
-    
-    Returns:
-        epoch: Epoch number from checkpoint
-        best_metric: Best metric from checkpoint
-        params: Parameters from checkpoint
+    Load model checkpoint.
     """
     if os.path.isfile(filename):
-        checkpoint = torch.load(filename, map_location=lambda storage, loc: storage)
+        checkpoint = torch.load(filename)
         model.load_state_dict(checkpoint['model_state_dict'])
-        
-        if 'optimizer_state_dict' in checkpoint and optimizer is not None:
-            try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except:
-                logging.warning("Could not load optimizer state - continuing without it")
-        
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch = checkpoint.get('epoch', 0)
-        
-        # Try to get best metric from various keys
-        if 'best_val_class_acc' in checkpoint:
-            best_metric = checkpoint['best_val_class_acc']
-        elif 'best_val_acc' in checkpoint:
-            best_metric = checkpoint['best_val_acc']
-        elif 'best_ae_loss' in checkpoint:
-            best_metric = checkpoint['best_ae_loss']
-        else:
-            best_metric = 0.0
-        
+        best_metrics = checkpoint.get('best_val_metrics', {'balanced_acc': 0.0})
         params = checkpoint.get('params', {})
-        
-        logging.info(f"Loaded checkpoint '{filename}' (epoch {epoch}) with best metric: {best_metric:.4f}")
-        return epoch, best_metric, params
+        logging.info(f"Loaded checkpoint '{filename}' (epoch {epoch})")
+        return epoch, best_metrics, params
     else:
         logging.warning(f"No checkpoint found at '{filename}'")
-        return 0, 0.0, {}
+        return 0, {'balanced_acc': 0.0}, {}
 
 def compute_features_statistics(dataset, params, num_features):
     """
-    Compute mean and variance of features for normalization
-    
-    Args:
-        dataset: Dataset to compute statistics from
-        params: Parameter dictionary
-        num_features: Number of features
-    
-    Returns:
-        means: Feature means tensor
-        variances: Feature variances tensor
+    Compute mean and variance for each feature.
     """
     stats_file = params['features_stats_json']
-    
-    # Check if stats already exist
     if os.path.exists(stats_file):
         logging.info(f"Loading features statistics from {stats_file}")
         with open(stats_file, 'r') as f:
@@ -139,50 +82,32 @@ def compute_features_statistics(dataset, params, num_features):
         return means, variances
     
     logging.info("Computing features statistics from training data...")
-    
-    # Create data loader for computing statistics
-    from torch.utils.data import DataLoader
-    from dataset import custom_collate_fn
-    
     data_loader = DataLoader(
         dataset, 
-        batch_size=params.get('batch_size', 32),
-        shuffle=False,
-        collate_fn=custom_collate_fn
+        batch_size=params.get('batch_size', 128), 
+        shuffle=False
     )
     
-    # Compute statistics
     total_sum = torch.zeros(num_features, dtype=torch.float64)
     total_sum_sq = torch.zeros(num_features, dtype=torch.float64)
     count = 0
     
-    for batch in tqdm(data_loader, desc="Computing statistics", unit="batch"):
-        features = batch['features'].to(torch.float64)  # [B, T, F]
-        
-        # Handle variable sequence lengths (in case of padding)
-        if 'mask' in batch:
-            mask = batch['mask']
-            B, T, F = features.shape
-            features_flat = features.reshape(-1, F)[mask.reshape(-1)]
-            count += features_flat.shape[0]
-            total_sum += features_flat.sum(dim=0)
-            total_sum_sq += (features_flat**2).sum(dim=0)
-        else:
-            B, T, F = features.shape
-            count += B * T
-            total_sum += features.sum(dim=(0,1))
-            total_sum_sq += (features**2).sum(dim=(0,1))
+    for batch in tqdm(data_loader, desc="Computing features statistics", unit="batch"):
+        features = batch['features'].to(torch.float64)
+        B, T, F = features.shape
+        count += B * T
+        total_sum += features.sum(dim=(0,1))
+        total_sum_sq += (features**2).sum(dim=(0,1))
     
-    # Calculate mean and variance
     means = (total_sum / count).to(torch.float32)
     variances = ((total_sum_sq / count) - (means.double()**2)).to(torch.float32)
     
     # Ensure positive variances
     variances = torch.clamp(variances, min=EPS)
     
-    # Save statistics
-    os.makedirs(os.path.dirname(stats_file), exist_ok=True)
     stats = {'means': means.tolist(), 'variances': variances.tolist()}
+    
+    os.makedirs(os.path.dirname(stats_file), exist_ok=True)
     with open(stats_file, 'w') as f:
         json.dump(stats, f)
     
@@ -191,235 +116,254 @@ def compute_features_statistics(dataset, params, num_features):
 
 def unnormalize_features(normalized_tensor, means, variances):
     """
-    Unnormalize features (inverse of normalization)
-    
-    Args:
-        normalized_tensor: Normalized features tensor
-        means: Feature means tensor
-        variances: Feature variances tensor
-    
-    Returns:
-        unnormalized_tensor: Unnormalized features tensor
+    Unnormalize features using mean and variance.
     """
     std = torch.sqrt(variances + EPS)
     unnorm = normalized_tensor.float() * std + means
     return torch.clamp(torch.round(unnorm), min=0).to(torch.int64)
 
+class MetricsTracker:
+    """
+    Track and compute metrics for anomaly detection.
+    """
+    def __init__(self, num_classes=5):
+        self.num_classes = num_classes
+        self.reset()
+        
+    def reset(self):
+        """Reset all metrics."""
+        self.true_labels = []
+        self.pred_labels = []
+        self.pred_probs = []
+        self.total_samples = 0
+        self.correct = 0
+        
+        # Per-class metrics
+        self.class_totals = torch.zeros(self.num_classes)
+        self.class_correct = torch.zeros(self.num_classes)
+        
+    def update(self, true_labels, pred_labels, pred_probs=None):
+        """
+        Update metrics with batch results.
+        
+        Args:
+            true_labels: Tensor of true class labels
+            pred_labels: Tensor of predicted class labels
+            pred_probs: Tensor of class probabilities (optional)
+        """
+        # Flatten if needed
+        if true_labels.ndim > 1:
+            true_labels = true_labels.view(-1)
+        if pred_labels.ndim > 1:
+            pred_labels = pred_labels.view(-1)
+        if pred_probs is not None and pred_probs.ndim > 2:
+            B, T, C = pred_probs.shape
+            pred_probs = pred_probs.view(B*T, C)
+        
+        # Update counts
+        self.true_labels.append(true_labels.cpu())
+        self.pred_labels.append(pred_labels.cpu())
+        if pred_probs is not None:
+            self.pred_probs.append(pred_probs.cpu())
+        
+        # Update accuracy metrics
+        correct = (true_labels == pred_labels).float()
+        self.total_samples += true_labels.size(0)
+        self.correct += correct.sum().item()
+        
+        # Update per-class metrics
+        for c in range(self.num_classes):
+            class_mask = (true_labels == c)
+            if class_mask.sum() > 0:
+                self.class_totals[c] += class_mask.sum().item()
+                self.class_correct[c] += (correct * class_mask.float()).sum().item()
+    
+    def compute_metrics(self):
+        """
+        Compute all metrics.
+        
+        Returns:
+            dict: Dictionary of metrics
+        """
+        # Concatenate all batches
+        all_true = torch.cat(self.true_labels, dim=0).numpy()
+        all_pred = torch.cat(self.pred_labels, dim=0).numpy()
+        
+        # Overall accuracy
+        accuracy = self.correct / self.total_samples if self.total_samples > 0 else 0.0
+        
+        # Per-class accuracy
+        class_accuracy = torch.zeros(self.num_classes)
+        for c in range(self.num_classes):
+            if self.class_totals[c] > 0:
+                class_accuracy[c] = self.class_correct[c] / self.class_totals[c]
+        
+        # Normal vs anomaly accuracy
+        normal_mask = (all_true == 0)
+        anomaly_mask = (all_true != 0)
+        
+        normal_total = normal_mask.sum()
+        anomaly_total = anomaly_mask.sum()
+        
+        normal_correct = ((all_true == all_pred) & normal_mask).sum()
+        anomaly_correct = ((all_true == all_pred) & anomaly_mask).sum()
+        
+        normal_acc = normal_correct / normal_total if normal_total > 0 else 0.0
+        anomaly_acc = anomaly_correct / anomaly_total if anomaly_total > 0 else 0.0
+        
+        # Balanced accuracy
+        balanced_acc = (normal_acc + anomaly_acc) / 2.0
+        
+        # Precision, recall, F1
+        precision, recall, f1, support = precision_recall_fscore_support(
+            all_true, all_pred, average=None)
+        
+        weighted_prec, weighted_rec, weighted_f1, _ = precision_recall_fscore_support(
+            all_true, all_pred, average='weighted')
+        
+        # Confusion matrix
+        cm = confusion_matrix(all_true, all_pred)
+        
+        return {
+            'accuracy': accuracy,
+            'class_accuracy': class_accuracy.tolist(),
+            'normal_acc': float(normal_acc),
+            'anomaly_acc': float(anomaly_acc),
+            'balanced_acc': float(balanced_acc),
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1': f1.tolist(),
+            'support': support.tolist(),
+            'weighted_precision': weighted_prec,
+            'weighted_recall': weighted_rec,
+            'weighted_f1': weighted_f1,
+            'confusion_matrix': cm.tolist()
+        }
+    
+    def log_metrics(self, prefix="", class_names=None):
+        """
+        Log metrics to the logging system.
+        
+        Args:
+            prefix: String prefix for the log messages
+            class_names: List of class names for prettier logging
+        """
+        metrics = self.compute_metrics()
+        
+        if not class_names:
+            class_names = [f"Class {i}" for i in range(self.num_classes)]
+            
+        # Log overall metrics
+        logging.info(f"{prefix} Overall Accuracy: {metrics['accuracy']:.4f}")
+        logging.info(f"{prefix} Balanced Accuracy: {metrics['balanced_acc']:.4f}")
+        logging.info(f"{prefix} Normal Accuracy: {metrics['normal_acc']:.4f}")
+        logging.info(f"{prefix} Anomaly Accuracy: {metrics['anomaly_acc']:.4f}")
+        logging.info(f"{prefix} Weighted Precision: {metrics['weighted_precision']:.4f}")
+        logging.info(f"{prefix} Weighted Recall: {metrics['weighted_recall']:.4f}")
+        logging.info(f"{prefix} Weighted F1: {metrics['weighted_f1']:.4f}")
+        
+        # Log per-class metrics
+        logging.info(f"{prefix} Per-class metrics:")
+        for i, (name, acc, prec, rec, f1, sup) in enumerate(zip(
+                class_names, 
+                metrics['class_accuracy'],
+                metrics['precision'],
+                metrics['recall'],
+                metrics['f1'],
+                metrics['support'])):
+            logging.info(f"  {name}: Acc={acc:.4f}, Prec={prec:.4f}, Rec={rec:.4f}, "
+                         f"F1={f1:.4f}, Support={sup}")
+            
+        return metrics
+
 def validate_csv(model, params, means, variances, device):
     """
-    Validate model on validation data and compute metrics
-    
-    Args:
-        model: Model to validate
-        params: Parameter dictionary
-        means: Feature means tensor
-        variances: Feature variances tensor
-        device: Device to validate on
-    
-    Returns:
-        balanced_acc: Balanced accuracy (average of normal and anomaly accuracies)
+    Validate model on validation set.
     """
     logging.info("Starting validation procedure...")
-    model.eval()
     
-    # Import necessary modules
-    from dataset import ParquetSequenceDataset, custom_collate_fn
-    from torch.utils.data import DataLoader
+    from dataset import SequenceStateCacheDataset, custom_collate_fn
     
-    # Create validation dataset
-    val_dataset = ParquetSequenceDataset(
+    val_dataset = SequenceStateCacheDataset(
         parquet_path=params['validation_parquet_path'],
         feature_columns=params['feature_columns'],
         seq_len=params['seq_len'],
-        stride=params.get('val_stride', params['seq_len']),
+        stride=params.get('stride', None),
         ratio=params.get('val_ratio', 1.0),
         seed=params['seed'],
         skip_anomalies=False,
-        normalization_stats={'means': means, 'variances': variances}
+        normalization_stats={'means': means, 'variances': variances},
+        use_state_cache=params.get('use_state_cache', True),
+        overlap_ratio=params.get('overlap_ratio', 0.5)
     )
     
-    # Create validation loader
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=params.get('batch_size', 32), 
+        batch_size=params['batch_size'], 
         shuffle=False, 
         collate_fn=custom_collate_fn
     )
+
+    model.eval()
+    tracker = MetricsTracker(num_classes=params.get('num_classes', 5))
     
-    # Collect predictions and true labels
-    pred_by_timestamp = {}
-    all_reconstruction_errors = []
-    
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validating", unit="batch"):
-            features = batch['features'].to(device)  # [B, T, num_features]
-            true_labels = batch['labels']            # [B, T]
-            
-            # Get predictions from model
-            if hasattr(model, 'train_autoencoder') and not model.train_classifier:
-                # Autoencoder-only mode
-                embedded = model.feature_embedding(features)
-                reconstructed, _ = model.autoencoder(embedded)
-                recon_error = torch.mean(torch.abs(embedded - reconstructed), dim=-1)
-                
-                # Use reconstruction error threshold for anomaly detection
-                threshold = params.get('recon_threshold', 0.1)
-                pred_labels = (recon_error > threshold).long().cpu()
-                
-                # Save reconstruction errors for analysis
-                all_reconstruction_errors.append(recon_error.cpu())
-            else:
-                # Full model with classifier
-                class_logits = model(features)
-                pred_labels = torch.argmax(class_logits, dim=-1).cpu()  # [B, T]
-            
-            # Store predictions by timestamp
-            for ts_list, t_labels, p_labels in zip(batch['timestamps'], true_labels, pred_labels):
-                for ts, t_label, p_label in zip(ts_list, t_labels.tolist(), p_labels.tolist()):
-                    if ts:  # Skip empty timestamps (padding)
-                        pred_by_timestamp[ts] = (t_label, p_label)
-    
-    if not pred_by_timestamp:
-        logging.warning("No predictions made during validation!")
-        return 0.0
-    
-    # Collate predictions and ground truth
-    all_true = []
-    all_pred = []
-    for t_label, p_label in pred_by_timestamp.values():
-        all_true.append(t_label)
-        all_pred.append(p_label)
-    
-    all_true = torch.tensor(all_true)
-    all_pred = torch.tensor(all_pred)
-    
-    # Compute per-class metrics
-    class_labels = torch.unique(all_true)
-    class_accuracies = {}
-    
-    for label in class_labels:
-        mask = (all_true == label)
-        total = mask.sum().item()
-        correct = (all_true[mask] == all_pred[mask]).sum().item()
-        accuracy = correct / total if total > 0 else 0.0
-        class_accuracies[label.item()] = (correct, total, accuracy)
-    
-    # Get anomaly class names
+    # Mapping for prettier logging
     anomaly_mapping = {v: k for k, v in val_dataset.anomaly_mapping.items()}
     anomaly_mapping[0] = "normal"
+    class_names = [anomaly_mapping.get(i, f"Class {i}") for i in range(params.get('num_classes', 5))]
     
-    # Log per-class metrics
-    for label, (correct, total, accuracy) in class_accuracies.items():
-        class_name = anomaly_mapping.get(label, f"Class {label}")
-        logging.info(f"{class_name}: {correct}/{total} ({accuracy*100:.2f}%)")
-    
-    # Compute normal vs anomaly metrics
-    normal_mask = (all_true == 0)
-    anomaly_mask = (all_true != 0)
-    
-    normal_total = normal_mask.sum().item()
-    anomaly_total = anomaly_mask.sum().item()
-    
-    normal_correct = (all_true[normal_mask] == all_pred[normal_mask]).sum().item() if normal_total > 0 else 0
-    anomaly_correct = (all_true[anomaly_mask] == all_pred[anomaly_mask]).sum().item() if anomaly_total > 0 else 0
-    
-    normal_acc = normal_correct / normal_total if normal_total > 0 else 0.0
-    anomaly_acc = anomaly_correct / anomaly_total if anomaly_total > 0 else 0.0
-    balanced_acc = (normal_acc + anomaly_acc) / 2.0
-    
-    logging.info(f"Normal Instances: {normal_correct}/{normal_total} ({normal_acc*100:.2f}%)")
-    logging.info(f"Anomaly Instances: {anomaly_correct}/{anomaly_total} ({anomaly_acc*100:.2f}%)")
-    logging.info(f"Balanced Accuracy: {balanced_acc*100:.2f}%")
-    
-    # Compute F1 scores
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        all_true.numpy(), all_pred.numpy(), 
-        average=None, 
-        labels=list(range(len(anomaly_mapping))),
-        zero_division=0
-    )
-    
-    # Log precision, recall, F1
-    logging.info("Precision, Recall, F1 by class:")
-    for i in range(len(precision)):
-        class_name = anomaly_mapping.get(i, f"Class {i}")
-        logging.info(f"{class_name}: P={precision[i]:.4f}, R={recall[i]:.4f}, F1={f1[i]:.4f}")
-    
-    # Compute confusion matrix
-    cm = confusion_matrix(all_true.numpy(), all_pred.numpy())
-    logging.info(f"Confusion Matrix:\n{cm}")
-    
-    # Plot and save confusion matrix if matplotlib is available
-    try:
-        plt.figure(figsize=(10, 8))
-        plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-        plt.title('Confusion Matrix')
-        plt.colorbar()
-        
-        classes = [anomaly_mapping.get(i, f"Class {i}") for i in range(len(anomaly_mapping))]
-        tick_marks = np.arange(len(classes))
-        plt.xticks(tick_marks, classes, rotation=45)
-        plt.yticks(tick_marks, classes)
-        
-        # Add text annotations
-        thresh = cm.max() / 2.0
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                plt.text(j, i, format(cm[i, j], 'd'),
-                        horizontalalignment="center",
-                        color="white" if cm[i, j] > thresh else "black")
-        
-        plt.tight_layout()
-        plt.ylabel('True label')
-        plt.xlabel('Predicted label')
-        
-        # Save figure
-        cm_plot_path = os.path.join(params['output_dir'], 'confusion_matrix.png')
-        plt.savefig(cm_plot_path)
-        plt.close()
-        logging.info(f"Confusion matrix saved to {cm_plot_path}")
-    except Exception as e:
-        logging.warning(f"Could not plot confusion matrix: {e}")
-    
-    # If we collected reconstruction errors, analyze them
-    if all_reconstruction_errors:
-        try:
-            all_errors = torch.cat(all_reconstruction_errors).numpy()
+    # Evaluate sequences
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Validating", unit="batch"):
+            features = batch['features'].to(device)
+            true_labels = batch['labels'].to(device)
             
-            # Plot histogram of reconstruction errors
-            plt.figure(figsize=(10, 6))
-            plt.hist(all_errors, bins=50, alpha=0.7)
-            plt.title('Reconstruction Error Distribution')
-            plt.xlabel('Reconstruction Error')
-            plt.ylabel('Count')
+            # Forward pass
+            class_logits = model(features)
             
-            # Save figure
-            error_plot_path = os.path.join(params['output_dir'], 'reconstruction_errors.png')
-            plt.savefig(error_plot_path)
-            plt.close()
-            logging.info(f"Reconstruction error distribution saved to {error_plot_path}")
-        except Exception as e:
-            logging.warning(f"Could not plot reconstruction errors: {e}")
+            # Get predictions
+            pred_labels = torch.argmax(class_logits, dim=-1)
+            class_probs = F.softmax(class_logits, dim=-1)
+            
+            # Update metrics
+            tracker.update(true_labels, pred_labels, class_probs)
     
-    return balanced_acc
+    # Calculate and log metrics
+    metrics = tracker.log_metrics(prefix="Validation", class_names=class_names)
+    
+    # Plot confusion matrix
+    cm = np.array(metrics['confusion_matrix'])
+    plot_confusion_matrix(cm, class_names, params['output_dir'], "validation_confusion_matrix.png")
+    
+    return metrics['balanced_acc']
+
+def plot_confusion_matrix(cm, class_names, output_dir, filename):
+    """
+    Plot and save confusion matrix.
+    """
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, filename))
+    plt.close()
 
 def log_model_size(model: torch.nn.Module, device: torch.device = None) -> None:
     """
-    Log model size and parameter counts
-    
-    Args:
-        model: Model to analyze
-        device: Optional device to move model to for analysis
+    Log model size and parameter count.
     """
     if device is not None:
         model.to(device)
     
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable_params = total_params - trainable_params
-    
-    # Log parameter counts
+
     if total_params >= 1e6:
         logging.info(
             f"Model parameters: Total: {total_params/1e6:.2f}M, "
@@ -432,259 +376,120 @@ def log_model_size(model: torch.nn.Module, device: torch.device = None) -> None:
             f"Trainable: {trainable_params/1e3:.2f}K, "
             f"Non-trainable: {non_trainable_params/1e3:.2f}K"
         )
-    
-    # Estimate model size in memory
-    bytes_per_param = 4  # assuming float32
+
+    bytes_per_param = 4
     total_bytes = total_params * bytes_per_param
     size_mb = total_bytes / (1024**2)
     logging.info(f"Approximate model size: {size_mb:.2f} MB (assuming fp32)")
-    
-    # Log model architecture
-    max_line_length = 80
-    model_str = str(model)
-    model_lines = model_str.split('\n')
-    
-    logging.info("Model architecture:")
-    for line in model_lines:
-        if len(line) > max_line_length:
-            # Truncate long lines
-            logging.info(f"  {line[:max_line_length-3]}...")
+
+class EarlyStopping:
+    """
+    Early stopping to prevent overfitting.
+    """
+    def __init__(self, patience=5, delta=0.001, mode='max', verbose=False):
+        """
+        Args:
+            patience: How many epochs to wait before stopping after best
+            delta: Minimum change to qualify as improvement
+            mode: 'min' or 'max' depending on whether lower or higher values are better
+            verbose: Whether to print info about early stopping
+        """
+        self.patience = patience
+        self.delta = delta
+        self.mode = mode
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.best_epoch = 0
+        
+    def __call__(self, epoch, score):
+        if self.best_score is None:
+            self.best_score = score
+            self.best_epoch = epoch
+            return False
+            
+        if self.mode == 'min':
+            improvement = self.best_score - score > self.delta
         else:
-            logging.info(f"  {line}")
-
-def plot_learning_curves(train_losses, val_metrics, output_dir):
-    """
-    Plot and save learning curves
-    
-    Args:
-        train_losses: List of training losses
-        val_metrics: List of validation metrics
-        output_dir: Directory to save plots to
-    """
-    try:
-        # Create directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Plot training loss
-        plt.figure(figsize=(10, 6))
-        plt.plot(train_losses, 'b-', label='Training Loss')
-        plt.title('Training Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        # Save figure
-        loss_plot_path = os.path.join(output_dir, 'training_loss.png')
-        plt.savefig(loss_plot_path)
-        plt.close()
-        
-        # Plot validation metrics
-        if val_metrics:
-            plt.figure(figsize=(10, 6))
-            for metric_name, values in val_metrics.items():
-                plt.plot(values, label=metric_name)
+            improvement = score - self.best_score > self.delta
             
-            plt.title('Validation Metrics')
-            plt.xlabel('Epoch')
-            plt.ylabel('Value')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            
-            # Save figure
-            metrics_plot_path = os.path.join(output_dir, 'validation_metrics.png')
-            plt.savefig(metrics_plot_path)
-            plt.close()
-            
-        logging.info(f"Learning curves saved to {output_dir}")
-    except Exception as e:
-        logging.warning(f"Could not plot learning curves: {e}")
-
-def plot_latent_space(model, val_loader, params, device=None):
-    """
-    Plot latent space representation using PCA or t-SNE
-    
-    Args:
-        model: Model to extract latent representations from
-        val_loader: DataLoader for validation data
-        params: Parameter dictionary
-        device: Device to run model on
-    """
-    try:
-        if device is None:
-            device = next(model.parameters()).device
-        
-        model.eval()
-        all_latents = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Extracting latent representations", unit="batch"):
-                features = batch['features'].to(device)
-                labels = batch['labels'].to(device)
-                
-                # Get latent representations
-                if hasattr(model, 'train_autoencoder') and hasattr(model, 'autoencoder'):
-                    # For TwoPhaseModel
-                    embedded = model.feature_embedding(features)
-                    _, latents = model.autoencoder(embedded)
-                elif hasattr(model, 'encode'):
-                    # For standalone autoencoder
-                    latents = model.encode(features)
-                else:
-                    # Use forward with return_latents flag if available
-                    if 'return_latents' in model.forward.__code__.co_varnames:
-                        _, latents = model(features, return_latents=True)
-                    else:
-                        logging.warning("Could not extract latent representations from model")
-                        return
-                
-                # Collect latents and labels
-                all_latents.append(latents.cpu().numpy().reshape(latents.shape[0], -1))
-                all_labels.append(labels.cpu().numpy().reshape(-1))
-        
-        if not all_latents:
-            logging.warning("No latent representations found for plotting")
-            return
-        
-        # Concatenate all latents and labels
-        all_latents = np.concatenate(all_latents, axis=0)
-        all_labels = np.concatenate(all_labels, axis=0)
-        
-        # Filter out padding (-1) labels
-        valid_mask = all_labels >= 0
-        all_latents = all_latents[valid_mask]
-        all_labels = all_labels[valid_mask]
-        
-        # Apply PCA
-        n_components = params.get('pca_n_components', 2)
-        pca = PCA(n_components=min(n_components, all_latents.shape[1]))
-        latent_pca = pca.fit_transform(all_latents)
-        
-        # Get explained variance
-        explained_variance = pca.explained_variance_ratio_
-        
-        # Create colormap for classes
-        unique_labels = np.unique(all_labels)
-        colors = plt.cm.jet(np.linspace(0, 1, len(unique_labels)))
-        
-        # Plot 2D or 3D visualization
-        if n_components >= 3 and latent_pca.shape[1] >= 3:
-            # 3D plot
-            fig = plt.figure(figsize=(12, 10))
-            ax = fig.add_subplot(111, projection='3d')
-            
-            for i, label in enumerate(unique_labels):
-                mask = all_labels == label
-                ax.scatter(
-                    latent_pca[mask, 0],
-                    latent_pca[mask, 1],
-                    latent_pca[mask, 2],
-                    c=[colors[i]],
-                    label=f'Class {label}',
-                    alpha=0.7
-                )
-            
-            ax.set_title('Latent Space (PCA, 3 Components)')
-            ax.set_xlabel(f'PC1 ({explained_variance[0]*100:.1f}% variance)')
-            ax.set_ylabel(f'PC2 ({explained_variance[1]*100:.1f}% variance)')
-            ax.set_zlabel(f'PC3 ({explained_variance[2]*100:.1f}% variance)')
-            ax.legend()
+        if improvement:
+            self.best_score = score
+            self.counter = 0
+            self.best_epoch = epoch
+            return False
         else:
-            # 2D plot
-            fig, ax = plt.subplots(figsize=(12, 10))
-            
-            for i, label in enumerate(unique_labels):
-                mask = all_labels == label
-                ax.scatter(
-                    latent_pca[mask, 0],
-                    latent_pca[mask, 1] if latent_pca.shape[1] > 1 else np.zeros_like(latent_pca[mask, 0]),
-                    c=[colors[i]],
-                    label=f'Class {label}',
-                    alpha=0.7
-                )
-            
-            ax.set_title('Latent Space (PCA, 2 Components)')
-            ax.set_xlabel(f'PC1 ({explained_variance[0]*100:.1f}% variance)')
-            if latent_pca.shape[1] > 1:
-                ax.set_ylabel(f'PC2 ({explained_variance[1]*100:.1f}% variance)')
-            ax.legend()
-        
-        # Save figure
-        latent_plot_path = os.path.join(params['output_dir'], 'latent_space.png')
-        plt.savefig(latent_plot_path)
-        plt.close()
-        
-        logging.info(f"Latent space visualization saved to {latent_plot_path}")
-    except Exception as e:
-        logging.warning(f"Could not plot latent space: {e}")
+            self.counter += 1
+            if self.verbose:
+                logging.info(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+            return False
 
-def diagnose_anomalies(model, val_loader, params, device=None, top_k=10):
+def plot_learning_curves(train_metrics, val_metrics, output_dir, filename_prefix="learning_curves"):
     """
-    Diagnose anomalies by analyzing examples with highest reconstruction errors
+    Plot and save learning curves.
     
     Args:
-        model: Model to use for diagnosis
-        val_loader: DataLoader for validation data
-        params: Parameter dictionary
-        device: Device to run model on
-        top_k: Number of top examples to analyze
+        train_metrics: List of dictionaries with training metrics
+        val_metrics: List of dictionaries with validation metrics
+        output_dir: Directory to save plots
+        filename_prefix: Prefix for filenames
     """
-    try:
-        if device is None:
-            device = next(model.parameters()).device
-        
-        model.eval()
-        errors_by_timestamp = {}
-        
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Diagnosing anomalies", unit="batch"):
-                features = batch['features'].to(device)
-                timestamps = batch['timestamps']
-                
-                # Get reconstruction from autoencoder
-                if hasattr(model, 'train_autoencoder') and hasattr(model, 'autoencoder'):
-                    # For TwoPhaseModel
-                    embedded = model.feature_embedding(features)
-                    reconstructed, _ = model.autoencoder(embedded)
-                    recon_error = torch.mean(torch.abs(embedded - reconstructed), dim=-1)
-                elif hasattr(model, 'decode'):
-                    # For standalone autoencoder
-                    reconstructed = model(features)
-                    recon_error = torch.mean(torch.abs(features - reconstructed), dim=-1)
-                else:
-                    logging.warning("Could not compute reconstruction errors from model")
-                    return
-                
-                # Store errors by timestamp
-                for ts_list, errors in zip(timestamps, recon_error):
-                    for ts, error in zip(ts_list, errors.cpu().numpy()):
-                        if ts:  # Skip empty timestamps (padding)
-                            errors_by_timestamp[ts] = error
-        
-        if not errors_by_timestamp:
-            logging.warning("No reconstruction errors found for diagnosis")
-            return
-        
-        # Sort timestamps by error
-        sorted_timestamps = sorted(
-            errors_by_timestamp.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        # Log top_k highest error examples
-        logging.info(f"Top {top_k} anomalies by reconstruction error:")
-        for i, (ts, error) in enumerate(sorted_timestamps[:top_k]):
-            logging.info(f"{i+1}. Timestamp: {ts}, Error: {error:.6f}")
-        
-        # Save top anomalies to CSV
-        anomalies_csv_path = os.path.join(params['output_dir'], 'top_anomalies.csv')
-        with open(anomalies_csv_path, 'w') as f:
-            f.write("Rank,Timestamp,ReconstructionError\n")
-            for i, (ts, error) in enumerate(sorted_timestamps[:top_k*10]):  # Save more for analysis
-                f.write(f"{i+1},{ts},{error:.6f}\n")
-        
-        logging.info(f"Top anomalies saved to {anomalies_csv_path}")
-    except Exception as e:
-        logging.warning(f"Could not diagnose anomalies: {e}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Extract epochs
+    epochs = range(1, len(train_metrics) + 1)
+    
+    # Plot loss curves
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, [m['loss'] for m in train_metrics], 'b-', label='Training Loss')
+    if 'loss' in val_metrics[0]:
+        plt.plot(epochs, [m['loss'] for m in val_metrics], 'r-', label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, f"{filename_prefix}_loss.png"))
+    plt.close()
+    
+    # Plot accuracy curves
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, [m['balanced_acc'] for m in train_metrics], 'b-', label='Training Balanced Acc')
+    plt.plot(epochs, [m['balanced_acc'] for m in val_metrics], 'r-', label='Validation Balanced Acc')
+    plt.xlabel('Epochs')
+    plt.ylabel('Balanced Accuracy')
+    plt.legend()
+    plt.title('Training and Validation Balanced Accuracy')
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, f"{filename_prefix}_balanced_acc.png"))
+    plt.close()
+    
+    # Plot normal vs anomaly accuracy
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, [m['normal_acc'] for m in train_metrics], 'b-', label='Train Normal Acc')
+    plt.plot(epochs, [m['anomaly_acc'] for m in train_metrics], 'g-', label='Train Anomaly Acc')
+    plt.plot(epochs, [m['normal_acc'] for m in val_metrics], 'r-', label='Val Normal Acc')
+    plt.plot(epochs, [m['anomaly_acc'] for m in val_metrics], 'm-', label='Val Anomaly Acc')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Normal vs Anomaly Accuracy')
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, f"{filename_prefix}_normal_anomaly_acc.png"))
+    plt.close()
+    
+    # Plot F1 scores
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, [m['f1_score'] for m in train_metrics], 'b-', label='Training F1')
+    plt.plot(epochs, [m['f1_score'] for m in val_metrics], 'r-', label='Validation F1')
+    plt.xlabel('Epochs')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.title('Training and Validation F1 Score')
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, f"{filename_prefix}_f1.png"))
+    plt.close()
