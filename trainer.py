@@ -14,66 +14,19 @@ import logging
 
 from utils import (save_checkpoint, start_logging, validate_csv, 
                    compute_features_statistics, log_model_size, EPS, load_checkpoint)
-from model import Model
+from model import Model, WeightedFocalLoss
 
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
-        """
-        Args:
-            gamma: Focusing parameter.
-            alpha: Tensor of shape [num_classes] with per-class weights.
-                   For your case, set alpha[0] = 0 (or a very small number) 
-                   and alpha for anomalies based on inverse frequency.
-            reduction: 'mean', 'sum', or 'none'.
-        """
-        super(FocalLoss, self).__init__()
-        self.gamma = gamma
-        self.alpha = alpha  # if None, defaults to 1 for all classes
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # Calculate the log probabilities.
-        logpt = -F.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(logpt)
-
-        # Get the alpha for each sample: if alpha is provided, index it by targets.
-        if self.alpha is not None:
-            at = self.alpha[targets]
-        else:
-            at = 1.0
-
-        loss = -at * ((1 - pt) ** self.gamma) * logpt
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
-
-
-def train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances):
+def train_classifier(model, train_loader, optimizer, device, params, means, variances):
     num_epochs = params.get('num_epochs', 10)
     best_val_class_acc = 0.0
 
+    # Use class counts from the dataset to compute inverse frequencies.
     counts_dataset = train_loader.dataset.counts
-    counts = torch.tensor([counts_dataset[i] for i in range(len(counts_dataset))], dtype=torch.float)
-    logging.info(f"Class counts: {counts.tolist()}")
+    logging.info(f"Class counts: {counts_dataset}")
 
-    # Compute inverse frequencies (add a small epsilon if needed).
-    inv_freq = 1.0 / (counts.float() + 1e-8)
+    weights = model.get_loss_weights(counts_dataset).to(device)
 
-    # Normalize the weights so they sum to 1 (or scale them appropriately).
-    alpha = inv_freq / inv_freq.sum()
-
-    # Move alpha to the device.
-    alpha = alpha.to(device)
-
-    # Then initialize your loss:
-    focal_loss_fn = FocalLoss(gamma=3.0, alpha=alpha, reduction='mean')
-
-    
-    mse_loss_fn = nn.MSELoss()
+    focal_loss = WeightedFocalLoss(weights)
 
     for epoch in range(1, num_epochs + 1):
         model.train()
@@ -84,37 +37,24 @@ def train_anomaly_detector(model, train_loader, optimizer, device, params, means
             optimizer.zero_grad()
             features = batch['features'].to(device)    # shape: [B, T, num_features]
             true_labels = batch['labels'].to(device)     # shape: [B, T]
-
-            # Forward pass.
-            recon, class_logits = model(features)  # recon: [B, T, num_features], logits: [B, T, num_classes]
-            recon = torch.cat(recon, dim=-1)  # [B, T, num_features]
             
-            # Reconstruction loss.
-            recon_loss = mse_loss_fn(recon, features)
+            class_logits = model(features)
+            total_loss = focal_loss(class_logits, true_labels)
             
-            # Classification loss computed per time step.
-            clf_loss = focal_loss_fn(class_logits.view(-1, len(counts)), true_labels.view(-1))
-            
-            # Total loss is the sum (you may weight each term as needed).
-            total_loss = recon_loss + 100 * clf_loss
             total_loss.backward()
             optimizer.step()
             
-            # --- New code: compute batch-level accuracy metrics ---
-            # Get predictions.
+            # Compute batch-level accuracy metrics.
             pred_labels = torch.argmax(class_logits, dim=-1)
             
-            # Masks for normal (0) and anomalies (1-4).
             normal_mask = (true_labels == 0)
             anomaly_mask = (true_labels != 0)
             
-            # Compute correct predictions and totals.
             normal_total = normal_mask.sum().item()
             anomaly_total = anomaly_mask.sum().item()
             normal_correct = (pred_labels[normal_mask] == true_labels[normal_mask]).sum().item() if normal_total > 0 else 0
             anomaly_correct = (pred_labels[anomaly_mask] == true_labels[anomaly_mask]).sum().item() if anomaly_total > 0 else 0
             
-            # Compute accuracy (avoid division by zero).
             normal_acc = normal_correct / normal_total if normal_total > 0 else 0.0
             anomaly_acc = anomaly_correct / anomaly_total if anomaly_total > 0 else 0.0
             
@@ -122,12 +62,9 @@ def train_anomaly_detector(model, train_loader, optimizer, device, params, means
             total_batches += 1
             pbar.set_postfix({
                 "Loss": f"{total_loss.item():.4f}",
-                "Recon": f"{recon_loss.item():.4f}",
-                "Clf": f"{clf_loss.item():.4f}",
                 "Acc_Normal": f"{normal_acc*100:.2f}%",
                 "Acc_Anomaly": f"{anomaly_acc*100:.2f}%"
             })
-
             
         avg_loss = total_loss_epoch / total_batches
         logging.info(f"Epoch {epoch} Average Loss: {avg_loss:.4f}")
@@ -154,7 +91,7 @@ def main_training_pipeline(params, model, train=True):
     logging.info(f"Using device: {device}")
 
     if train:
-        # Create the training dataset (including anomalies and per–timestamp labels).
+        # Create the training dataset (map-style dataset with oversampling).
         train_dataset = ParquetSequenceDataset(
             parquet_path=params['parquet_path'],
             feature_columns=params['feature_columns'],
@@ -162,25 +99,27 @@ def main_training_pipeline(params, model, train=True):
             stride=params['stride'],
             ratio=params['train_ratio'],
             seed=params['seed'],
-            skip_anomalies=False,  # include all instances for training
-            normalization_stats=None  # initially unnormalized to compute stats
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=params['batch_size'],
-            shuffle=False,
-            collate_fn=custom_collate_fn,
+            skip_anomalies=False,
+            normalization_stats=None
         )
 
         # Compute per–feature statistics.
         num_features = len(params['feature_columns'])
-        means, variances = compute_features_statistics(train_loader, params, num_features)
+        means, variances = compute_features_statistics(train_dataset, params, num_features)
         # Reinitialize dataset with normalization.
-        train_dataset.normalization_stats = {'means': means, 'variances': variances}
+        #balanced_dataset.normalization_stats = {'means': means, 'variances': variances}
         
         log_model_size(model, device)
         optimizer = torch.optim.Adam(model.parameters(), lr=params.get('lr', 1e-3))
-        model, best_acc = train_anomaly_detector(model, train_loader, optimizer, device, params, means, variances)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=params['batch_size'],
+            shuffle=True,
+            collate_fn=custom_collate_fn,
+        )
+        
+        model, best_acc = train_classifier(model, train_loader, optimizer, device, params, means, variances)
         logging.info(f"Training complete. Best Validation Classification Accuracy: {best_acc:.4f}")
     else:
         # Load the model from the checkpoint.
@@ -205,12 +144,12 @@ if __name__ == '__main__':
         'validation_parquet_path': 'unscaled_pdsch_val_min.parquet', 
         'output_dir': './output',
         'feature_columns': ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
-        'seq_len': 20,
-        'stride': 5,
-        'train_ratio': 0.01, # less than 0.2, not enough class
+        'seq_len': 100,
+        'stride': 100,
+        'train_ratio': 1.0,
         'val_ratio': 1.0,
         'seed': 42,
-        'batch_size': 64,
+        'batch_size': 16,
         'num_epochs': 1,
         'lr': 5e-4,
         'hidden_dim': 64,
@@ -224,7 +163,9 @@ if __name__ == '__main__':
     start_logging(params)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_features = len(params['feature_columns'])
-    model = Model(num_features=num_features, hidden_dim=params['hidden_dim'], dropout=params['dropout'])
+    feature_ranges = [1023, 30, 15, 32, 1, 8, 1]
+
+    model = Model(feature_ranges)
     model.to(device)
 
     model, params = main_training_pipeline(params, model, params['train'])

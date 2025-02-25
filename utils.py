@@ -58,7 +58,7 @@ def load_checkpoint(filename: str, model: nn.Module, optimizer: torch.optim.Opti
         logging.warning(f"No checkpoint found at '{filename}'")
         return 0, 0.0, {}
 
-def compute_features_statistics(train_loader, params, num_features):
+def compute_features_statistics(data_loader, params, num_features):
     stats_file = params['features_stats_json']
     if os.path.exists(stats_file):
         logging.info(f"Loading features statistics from {stats_file}")
@@ -72,7 +72,7 @@ def compute_features_statistics(train_loader, params, num_features):
     total_sum = torch.zeros(num_features, dtype=torch.float64)
     total_sum_sq = torch.zeros(num_features, dtype=torch.float64)
     count = 0
-    for batch in tqdm(train_loader, desc="Computing features statistics", unit="batch"):
+    for batch in tqdm(data_loader, desc="Computing features statistics", unit="batch"):
         features = batch['features'].to(torch.float64)
         B, T, F = features.shape
         count += B * T
@@ -101,7 +101,7 @@ def produce_anomalies_per_instance(model, val_loader, device):
             for batch in val_loader:
                 true_labels = batch['labels'].to(device)
                 features = batch['features'].to(device)
-                _, class_logits = model(features)
+                class_logits = model(features)
                 all_true_labels.append(true_labels.cpu())
                 pred_labels = torch.argmax(class_logits, dim=-1)
                 all_pred_labels.append(pred_labels.cpu())
@@ -135,7 +135,7 @@ def validate_csv(model, params, means, variances, device):
         for batch in tqdm(val_loader, desc="Validating", unit="batch"):
             features = batch['features'].to(device)  # [B, T, num_features]
             true_labels = batch['labels']            # [B, T]
-            _, class_logits = model(features)
+            class_logits = model(features)
             pred_labels = torch.argmax(class_logits, dim=-1).cpu()  # [B, T]
             for ts_list, true_seq, pred_seq in zip(batch['timestamps'], true_labels, pred_labels):
                 for ts, t_label, p_label in zip(ts_list, true_seq.tolist(), pred_seq.tolist()):
@@ -145,7 +145,6 @@ def validate_csv(model, params, means, variances, device):
         logging.warning("No predictions made during validation!")
         return 0.0
 
-    # Gather all true and predicted labels.
     all_true = []
     all_pred = []
     for t_label, p_label in pred_by_timestamp.values():
@@ -154,7 +153,6 @@ def validate_csv(model, params, means, variances, device):
     all_true = torch.tensor(all_true)
     all_pred = torch.tensor(all_pred)
 
-    # Calculate accuracy for each class.
     class_labels = torch.unique(all_true)
     class_accuracies = {}
     for label in class_labels:
@@ -164,13 +162,11 @@ def validate_csv(model, params, means, variances, device):
         accuracy = correct / total if total > 0 else 0.0
         class_accuracies[label.item()] = (correct, total, accuracy)
 
-    # Log individual class accuracies.
-    anomaly_mapping = {v: k for k, v in val_loader.dataset.anomaly_mapping.items()}
+    anomaly_mapping = {v: k for k, v in val_dataset.anomaly_mapping.items()}
     for label, (correct, total, accuracy) in class_accuracies.items():
         class_name = anomaly_mapping.get(label, f"Class {label}")
         logging.info(f"{class_name}: {correct}/{total} ({accuracy*100:.2f}%)")
 
-    # Separate normal (label 0) and anomaly (labels != 0) samples.
     normal_mask = (all_true == 0)
     anomaly_mask = (all_true != 0)
     normal_total = normal_mask.sum().item()
@@ -186,11 +182,7 @@ def validate_csv(model, params, means, variances, device):
     logging.info(f"Anomaly Instances: {anomaly_correct}/{anomaly_total} ({anomaly_acc*100:.2f}%)")
     logging.info(f"Balanced Accuracy: {balanced_acc*100:.2f}%")
 
-    plot_performance_metrics(all_true, all_pred, params)
-
     return balanced_acc
-
-
 
 def plot_latent_space(model, val_loader, params):
     model.eval()
@@ -199,7 +191,8 @@ def plot_latent_space(model, val_loader, params):
     with torch.no_grad():
         for batch in val_loader:
             features = batch['features'].to(device)
-            _, _, latents = model(features, return_latents=True)
+            # Model returns (class_logits, latents) when return_latents=True
+            _, latents = model(features, return_latents=True)
             all_latents.append(latents.cpu().numpy())
     if not all_latents:
         logging.warning("No latent representations found for plotting.")
@@ -263,59 +256,3 @@ def log_model_size(model: torch.nn.Module, device: torch.device = None) -> None:
     total_bytes = total_params * bytes_per_param
     size_mb = total_bytes / (1024**2)
     logging.info(f"Approximate model size: {size_mb:.2f} MB (assuming fp32)")
-
-
-def plot_performance_metrics(all_true, all_pred, params):
-    """
-    Save performance plots (confusion matrix and detection ratio by class)
-    to the output directory.
-    """
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from sklearn.metrics import confusion_matrix
-
-    # Compute the confusion matrix.
-    cm = confusion_matrix(all_true, all_pred)
-    plt.figure(figsize=(10, 8))
-    plt.imshow(cm, interpolation='nearest', cmap='Blues')
-    plt.title("Confusion Matrix")
-    plt.colorbar()
-    tick_marks = np.arange(len(np.unique(all_true)))
-    plt.xticks(tick_marks, tick_marks)
-    plt.yticks(tick_marks, tick_marks)
-    plt.xlabel("Predicted Class")
-    plt.ylabel("True Class")
-
-    cm = confusion_matrix(all_true, all_pred)
-    logging.info("Confusion Matrix:\n%s", cm)
-
-    # Annotate the confusion matrix.
-    thresh = cm.max() / 2.
-    for i, j in np.ndindex(cm.shape):
-        plt.text(j, i, format(cm[i, j], 'd'),
-                 horizontalalignment="center",
-                 color="white" if cm[i, j] > thresh else "black")
-
-    cm_path = os.path.join(params['output_dir'], 'confusion_matrix.png')
-    plt.savefig(cm_path)
-    plt.close()
-    logging.info(f"Confusion matrix saved to {cm_path}")
-
-    # Compute per-class detection accuracy.
-    classes = np.unique(all_true)
-    accuracies = []
-    for cls in classes:
-        mask = (all_true == cls)
-        acc = (all_true[mask] == all_pred[mask]).float().mean() if mask.sum() > 0 else 0
-        accuracies.append(acc)
-    plt.figure(figsize=(10, 6))
-    plt.bar(classes, accuracies, color='skyblue')
-    plt.title("Detection Ratio by Class")
-    plt.xlabel("Class")
-    plt.ylabel("Accuracy")
-    plt.ylim(0, 1)
-    dr_path = os.path.join(params['output_dir'], 'detection_ratio_by_class.png')
-    plt.savefig(dr_path)
-    plt.close()
-    logging.info(f"Detection ratio by class plot saved to {dr_path}")

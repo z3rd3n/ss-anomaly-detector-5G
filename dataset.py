@@ -1,17 +1,15 @@
 # dataset.py
-import random
 import logging
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset
 
 EPS = 1e-8  # small constant
 
 def custom_collate_fn(batch):
     """
     Merges a list of samples into a batch.
-    Now also stacks 'labels' (per timestamp) if present.
     """
     try:
         features = torch.stack([item['features'] for item in batch])
@@ -25,46 +23,41 @@ def custom_collate_fn(batch):
         logging.error(f"Error in collate_fn: {e}")
         return {}
 
-class ParquetSequenceDataset(IterableDataset):
+class ParquetSequenceDataset(Dataset):
     def __init__(self,
                  parquet_path: str,
-                 feature_columns: list,  # e.g., ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI']
+                 feature_columns: list,
                  seq_len: int,
                  stride: int = None,
-                 shuffle_files: bool = True,
-                 ratio: float = 0.2,
+                 ratio: float = 1.0,
                  seed: int = 42,
-                 skip_anomalies: bool = False,  # if True, skip sequences containing anomalies
-                 normalization_stats: dict = None):
+                 skip_anomalies: bool = False,
+                 normalization_stats: dict = None,
+                 pre_normalize: bool = True):
         """
         Loads sequences from a parquet file.
-        Each sample includes a 'labels' tensor derived from the 'insight' column.
         
-        The 'insight' column is assumed to be a comma-separated string 
-        (e.g. "max_retx_achieved, unnecessary_retx") for anomalous rows and empty for normal rows.
-        
-        New deterministic mapping (no composite labeling):
-          - Empty or missing insight: 0
-          - unnecessary_retx: 1 
-          - missing_retx: 2 
-          - new_data_no_retx: 3 
-          - max_retx_achieved: 4
-          
-        In cases where multiple anomalies occur in a single timestamp, if one of them
-        is max_retx_achieved and there is at least one other anomaly, the max_retx_achieved 
-        is ignored and the remaining anomaly with the smallest mapping value is chosen.
+        Args:
+            parquet_path: Path to the parquet file
+            feature_columns: List of column names to use as features
+            seq_len: Length of each sequence
+            stride: Stride between sequences (default: equal to seq_len)
+            ratio: Portion of data to use (1.0 = all data)
+            seed: Random seed for reproducibility
+            skip_anomalies: If True, skip sequences containing anomalies
+            normalization_stats: Dictionary with 'means' and 'variances' for normalization
+            pre_normalize: If True, normalize features at load time
         """
+        super().__init__()
         self.parquet_path = parquet_path
         self.feature_columns = feature_columns
         self.seq_len = seq_len
         self.stride = stride if stride is not None else seq_len
-        self.shuffle_files = shuffle_files
-        self.ratio = ratio
-        self.seed = seed
         self.skip_anomalies = skip_anomalies
         self.normalization_stats = normalization_stats
+        self.pre_normalize = pre_normalize
 
-        # Define the fixed, deterministic mapping.
+        # Define mapping for anomaly labels
         self.anomaly_mapping = {
             "unnecessary_retx": 1,
             "missing_retx": 2,
@@ -72,47 +65,139 @@ class ParquetSequenceDataset(IterableDataset):
             "max_retx_achieved": 4,
         }
 
-        # Pre-read file_id column to compute row counts.
-        df_ids = pd.read_parquet(self.parquet_path, columns=['file_id'])
-        self.total_rows = len(df_ids)
-        file_counts = df_ids['file_id'].value_counts().to_dict()
-        self.all_file_ids = sorted(list(file_counts.keys()))
+        # Load data and prepare sequences
+        self._load_data(ratio, seed)
+        self._prepare_sequences()
+        self._report_class_counts()
+
+    def _load_data(self, ratio, seed):
+        """Load data from the parquet file"""
+        logging.info(f"Loading data from {self.parquet_path}")
         
-        if self.shuffle_files:
-            random.seed(self.seed)
-            file_ids_shuffled = self.all_file_ids.copy()
-            random.shuffle(file_ids_shuffled)
+        # Sample files if ratio < 1.0
+        if ratio < 1.0:
+            df_ids = pd.read_parquet(self.parquet_path, columns=['file_id'])
+            unique_file_ids = df_ids['file_id'].unique()
+            
+            np.random.seed(seed)
+            num_files = max(1, int(len(unique_file_ids) * ratio))
+            sampled_files = np.random.choice(unique_file_ids, num_files, replace=False)
+            
+            # Load only sampled files
+            self.df = pd.read_parquet(
+                self.parquet_path,
+                filters=[('file_id', 'in', sampled_files.tolist())]
+            )
         else:
-            file_ids_shuffled = self.all_file_ids
-
-        cumulative = 0
-        self.selected_file_ids = []
-        threshold = self.ratio * self.total_rows
-        for fid in file_ids_shuffled:
-            cumulative += file_counts[fid]
-            self.selected_file_ids.append(fid)
-            if cumulative >= threshold:
-                break
+            # Load all data
+            self.df = pd.read_parquet(self.parquet_path)
         
-        logging.info(f"Selected {len(self.selected_file_ids)} files for training.")
-        self.file_seq_counts = {}
-        total_seq = 0
-        for fid in self.selected_file_ids:
-            count = file_counts[fid]
-            n_seq = max(0, (count - self.seq_len) // self.stride + 1)
-            self.file_seq_counts[fid] = n_seq
-            total_seq += n_seq
-        self._length = total_seq
+        # Ensure required columns exist
+        if 'insight' not in self.df.columns:
+            self.df['insight'] = ""
+        
+        if 'timestamp_str' not in self.df.columns:
+            self.df['timestamp_str'] = ["" for _ in range(len(self.df))]
+        
+        # Extract and potentially normalize features
+        features = self.df[self.feature_columns].values
+        
+        # Normalize features if requested
+        if self.normalization_stats and self.pre_normalize:
+            means = self.normalization_stats.get('means')
+            variances = self.normalization_stats.get('variances')
+            std = np.sqrt(np.array(variances) + EPS)
+            features = (features - np.array(means)) / std
+        
+        # Convert to torch tensor
+        self.features = torch.tensor(features, dtype=torch.float32)
+        
+        # Process labels
+        self.labels = torch.tensor([
+            self.insight_to_label(insight) for insight in self.df['insight']
+        ], dtype=torch.long)
+        
+        # Store timestamps
+        self.timestamps = self.df['timestamp_str'].tolist()
+        
+        logging.info(f"Loaded {len(self.df)} rows from the dataset")
 
-        # Report the class distribution from the selected training files.
-        self.report_class_counts()
+    def _prepare_sequences(self):
+        """Pre-compute all valid sequence indices"""
+        self.sequences = []
+        
+        # Group by file_id to ensure sequences come from the same file
+        for _, group_indices in self.df.groupby('file_id').groups.items():
+            indices = list(group_indices)
+            num_rows = len(indices)
+            
+            if num_rows < self.seq_len:
+                continue
+            
+            # Generate valid sequence indices
+            for start_idx in range(0, num_rows - self.seq_len + 1, self.stride):
+                seq_indices = indices[start_idx:start_idx + self.seq_len]
+                
+                # Skip sequences with anomalies if requested
+                if self.skip_anomalies:
+                    seq_labels = self.labels[seq_indices]
+                    if (seq_labels != 0).any():
+                        continue
+                        
+                self.sequences.append(seq_indices)
+                
+        logging.info(f"Generated {len(self.sequences)} sequences")
 
-    def _normalize(self, features: torch.Tensor):
-        if not self.normalization_stats:
+    def insight_to_label(self, insight):
+        """Convert insight string to integer label"""
+        if pd.isna(insight) or insight.strip() == "":
+            return 0
+
+        # Parse anomalies from the insight string
+        anomalies = [a.strip() for a in insight.split(",") if a.strip()]
+        if not anomalies:
+            return 0
+
+        # Special case: remove max_retx_achieved if other anomalies exist
+        if len(anomalies) > 1 and "max_retx_achieved" in anomalies:
+            anomalies = [a for a in anomalies if a != "max_retx_achieved"]
+        
+        # Get valid anomaly labels
+        valid_labels = [self.anomaly_mapping.get(a) for a in anomalies 
+                        if a in self.anomaly_mapping]
+        
+        # Return 0 if no valid anomalies
+        if not valid_labels:
+            return 0
+            
+        # Return the smallest valid label
+        return min(valid_labels)
+    
+    def _report_class_counts(self):
+        """Report class distribution in the dataset"""
+        unique_labels, counts = torch.unique(self.labels, return_counts=True)
+        
+        logging.info("Class distribution in the dataset:")
+        reverse_mapping = {v: k for k, v in self.anomaly_mapping.items()}
+        reverse_mapping[0] = "normal"
+        
+        # Store counts for future reference
+        self.counts = {label.item(): count.item() 
+                      for label, count in zip(unique_labels, counts)}
+        
+        # Log the counts
+        for label, count in self.counts.items():
+            label_name = reverse_mapping.get(label, "unknown")
+            logging.info(f"  {label} ({label_name}): {count}")
+
+    def _normalize(self, features):
+        """Normalize features on-the-fly if not pre-normalized"""
+        if not self.normalization_stats or self.pre_normalize:
             return features
 
         means = self.normalization_stats.get('means')
         variances = self.normalization_stats.get('variances')
+        
         if not torch.is_tensor(means):
             means = torch.tensor(means, dtype=torch.float32, device=features.device)
         if not torch.is_tensor(variances):
@@ -121,133 +206,25 @@ class ParquetSequenceDataset(IterableDataset):
         std = torch.sqrt(variances + EPS)
         return (features.float() - means) / std
 
-    def insight_to_label(self, insight: str) -> int:
-        """
-        Converts an insight string into a deterministic integer label.
+    def __getitem__(self, index):
+        """Get a sequence by index"""
+        seq_indices = self.sequences[index]
         
-        - Empty or missing insight yields label 0.
-        - Otherwise, splits the string on commas and strips whitespace.
-          If multiple anomalies exist and one of them is "max_retx_achieved",
-          that anomaly is ignored (provided at least one other exists).
-          From the remaining anomalies (or the single anomaly if only one exists),
-          the one with the smallest corresponding mapping value is chosen.
-        """
-        if pd.isna(insight) or insight.strip() == "":
-            return 0
-
-        anomalies = [a.strip() for a in insight.split(",") if a.strip()]
-        if not anomalies:
-            return 0
-
-        # If multiple anomalies exist and one is max_retx_achieved, remove it.
-        if len(anomalies) > 1 and "max_retx_achieved" in anomalies:
-            anomalies = [a for a in anomalies if a != "max_retx_achieved"]
-        if len(anomalies) > 1:
-            logging.info(f"Multiple anomalies found: {anomalies}")
-
-        # Ensure there is only one anomaly.
-        candidate_labels = [self.anomaly_mapping[a] for a in anomalies if a in self.anomaly_mapping]
-        if len(candidate_labels) != 1:
-            raise ValueError(f"Multiple or no valid anomalies found: {anomalies}")
-        return candidate_labels[0]
-    
-    def report_class_counts(self):
-        """
-        Goes through all selected training files, counts the number of rows for each class,
-        and logs the distribution. Also checks that the total number of labels matches the number of rows.
-        """
-        counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
-        total_labels = 0
-        total_rows = 0
-        for fid in self.selected_file_ids:
-            try:
-                df = pd.read_parquet(self.parquet_path, columns=['insight'], filters=[('file_id', '==', fid)])
-            except Exception as e:
-                logging.error(f"Error reading file {fid} for class counts: {e}")
-                continue
-            for insight in df['insight']:
-                label = self.insight_to_label(insight)
-                counts[label] += 1
-                total_labels += 1
-            total_rows += len(df)
+        # Get features, labels, and timestamps for this sequence
+        seq_features = self.features[seq_indices]
+        seq_labels = self.labels[seq_indices]
+        seq_timestamps = [self.timestamps[i] for i in seq_indices]
         
-        if total_labels != total_rows:
-            logging.error(f"Total number of labels ({total_labels}) does not match total number of rows ({total_rows}).")
-        else:
-            logging.info(f"Total number of labels matches total number of rows: {total_rows}")
-
-        logging.info("Class distribution in training files:")
-        reverse_mapping = {v: k for k, v in self.anomaly_mapping.items()}
-        reverse_mapping[0] = "normal"
-        self.counts = counts
-        for label, cnt in counts.items():
-            label_name = reverse_mapping.get(label, "unknown")
-            logging.info(f"  {label} ({label_name}): {cnt}")
-
-    def __iter__(self):
-        file_ids = self.selected_file_ids.copy()
-        if self.shuffle_files:
-            random.shuffle(file_ids)
-
-        # Iterate over each selected file.
-        for fid in file_ids:
-            df = pd.read_parquet(self.parquet_path, filters=[('file_id', '==', fid)])
-            df = df.reset_index(drop=True)
-            num_rows = len(df)
-            if num_rows < self.seq_len:
-                continue
-
-            # Get timestamps.
-            timestamps_all = df['timestamp_str'].tolist() if 'timestamp_str' in df.columns else ["" for _ in range(num_rows)]
-            
-            # Get feature values.
-            try:
-                features_all = df[self.feature_columns].to_numpy()
-            except Exception as e:
-                logging.error(f"Error extracting features from file_id {fid}: {e}")
-                if self.skip_anomalies:
-                    continue
-                else:
-                    raise e
-
-            # Read the 'insight' column (defaulting to empty strings if missing).
-            if 'insight' in df.columns:
-                insights_all = df['insight'].tolist()
-            else:
-                insights_all = ["" for _ in range(num_rows)]
-            
-            # Generate sequences.
-            for start in range(0, num_rows - self.seq_len + 1, self.stride):
-                end = start + self.seq_len
-                seq_features = features_all[start:end]
-                seq_timestamps = timestamps_all[start:end]
-                seq_insights = insights_all[start:end]
-                try:
-                    seq_tensor = torch.tensor(seq_features, dtype=torch.float32)
-                except Exception as e:
-                    logging.error(f"Error converting features to tensor for file_id {fid} rows {start}:{end}: {e}")
-                    if self.skip_anomalies:
-                        continue
-                    else:
-                        raise e
-
-                # Convert insight strings into deterministic labels.
-                labels = torch.tensor(
-                    [self.insight_to_label(insight) for insight in seq_insights],
-                    dtype=torch.long
-                )
-                
-                # Optionally, skip sequences that contain any anomalies.
-                if self.skip_anomalies and (labels != 0).any():
-                    continue
-
-                norm_features = self._normalize(seq_tensor)
-
-                yield {
-                    'features': norm_features,
-                    'timestamps': seq_timestamps,
-                    'labels': labels
-                }
+        # Normalize if needed and not already done
+        if self.normalization_stats and not self.pre_normalize:
+            seq_features = self._normalize(seq_features)
+        
+        return {
+            'features': seq_features,
+            'timestamps': seq_timestamps,
+            'labels': seq_labels
+        }
 
     def __len__(self):
-        return self._length
+        """Return the number of sequences"""
+        return len(self.sequences)
