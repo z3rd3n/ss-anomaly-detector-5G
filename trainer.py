@@ -15,6 +15,61 @@ from sklearn.metrics import classification_report, precision_recall_curve, avera
 
 from dataset import BinaryAnomalyDataset, create_binary_dataloader, binary_collate_fn
 from model import TimeSeriesAnomalyDetector
+from datetime import datetime
+
+def start_logging(params=None):
+    """
+    Initialize logging.
+    """
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = params['output_dir'] if params and 'output_dir' in params else 'output'
+    os.makedirs(output_dir, exist_ok=True)
+    log_dir = os.path.join(output_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'log_training_{current_time}.log')
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filemode='w'
+    )
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console.setFormatter(formatter)
+    logging.getLogger('').addHandler(console)
+    if params:
+        logging.info("Hyperparameters and settings:")
+        for key, value in params.items():
+            logging.info(f"{key}: {value}")
+    return log_file
+
+def log_model_size(model):
+    """
+    Log model size and number of parameters.
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+    
+    if total_params >= 1e6:
+        logging.info(
+            f"Model parameters: Total: {total_params/1e6:.2f}M, "
+            f"Trainable: {trainable_params/1e6:.2f}M, "
+            f"Non-trainable: {non_trainable_params/1e6:.2f}M"
+        )
+    else:
+        logging.info(
+            f"Model parameters: Total: {total_params/1e3:.2f}K, "
+            f"Trainable: {trainable_params/1e3:.2f}K, "
+            f"Non-trainable: {non_trainable_params/1e3:.2f}K"
+        )
+        
+    # Estimate model size in memory
+    bytes_per_param = 4  # assuming float32
+    model_size_bytes = total_params * bytes_per_param
+    model_size_mb = model_size_bytes / (1024 * 1024)
+    logging.info(f"Approximate model size in memory: {model_size_mb:.2f} MB")
 
 # Constants
 EPS = 1e-8
@@ -636,21 +691,6 @@ def train_binary_model(params):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     
-    # Load feature statistics from file
-    stats_file = params.get('features_stats_json', 'feature_stats.json')
-    if os.path.exists(stats_file):
-        logging.info(f"Loading feature statistics from {stats_file}")
-        with open(stats_file, 'r') as f:
-            feature_stats = json.load(f)
-    else:
-        # Use default statistics to avoid errors
-        numerical_features = params.get('numerical_features', ['SFN', 'Slot', 'MCS', 'ReTx'])
-        feature_stats = {
-            'means': [0.0] * len(numerical_features),
-            'stds': [1.0] * len(numerical_features)
-        }
-        logging.warning(f"Feature statistics file {stats_file} not found, using default values")
-    
     # Get categorical dimensions
     categorical_dims = {}
     categorical_features = params.get('categorical_features', ['HARQ', 'CRC', 'NDI'])
@@ -676,10 +716,7 @@ def train_binary_model(params):
     )
     model.to(device)
     
-    # Log model size
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info(f"Model parameters: Total: {total_params:,}, Trainable: {trainable_params:,}")
+    log_model_size(model)
     
     # Create trainer
     trainer = BinaryAnomalyTrainer(model, params, device)
@@ -763,3 +800,60 @@ def load_and_evaluate_model(model_path, params, device=None):
     logging.info("Evaluation complete.")
     
     return model, trainer, evaluation_results
+
+
+def main():
+    """Main execution function"""
+    
+    # Get default parameters and update with arguments
+    params = {
+        'parquet_path': 'unscaled_pdsch_val.parquet',
+        'validation_parquet_path': 'unscaled_pdsch_val_min.parquet',
+        'output_dir': 'output',
+        'feature_columns': ["SFN", "Slot", "HARQ", "MCS", "CRC", "ReTx", "NDI"],
+        'numerical_features': ['SFN', 'Slot', 'MCS', 'ReTx'],
+        'categorical_features': ['HARQ', 'CRC', 'NDI'],
+        'seq_len': 100,
+        'stride': 50,
+        'overlap_ratio': 0.5,
+        'train_ratio': 0.2,
+        'val_ratio': 1.0,
+        'seed': 42,
+        'batch_size': 64,
+        'num_epochs': 1,
+        'lr': 5e-4,
+        'weight_decay': 1e-5,
+        'grad_clip': 1.0,
+        'embedding_dim': 8,
+        'hidden_dim': 128,
+        'latent_dim': 64,
+        'num_layers': 2,
+        'dropout': 0.3,
+        'focal_alpha': 0.75,
+        'focal_gamma': 2.0,
+        'use_balanced_sampling': True,
+        'use_state_cache': True,
+        'pre_normalize': True,
+        'num_workers': 4,
+        'checkpoint_interval': 5,
+        'features_stats_json': 'features_stats.json',
+        'anomaly_threshold': 0.5,
+        'max_samples': None
+    }
+    
+    # Set up logging
+    start_logging(params)
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(params['seed'])
+    np.random.seed(params['seed'])
+    
+    # Train a new model
+    logging.info("Training new model...")
+    _, _, best_metrics = train_binary_model(params)
+    logging.info(f"Training complete. Best metrics: {best_metrics}")
+    
+    logging.info("Process complete!")
+
+if __name__ == "__main__":
+    main()

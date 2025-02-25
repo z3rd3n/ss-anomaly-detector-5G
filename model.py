@@ -192,9 +192,6 @@ class BinaryAnomalyDetector(nn.Module):
         )
         
     def forward(self, numerical_features, categorical_features, hidden_state=None):
-        # Process numerical features [B, T, numerical_dim]
-        batch_size, seq_len = numerical_features.shape[0], numerical_features.shape[1]
-        
         # Process categorical features
         categorical_embedded = self.categorical_encoder(categorical_features)  # [B, T, cat_emb_dim]
         
