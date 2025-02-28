@@ -1,578 +1,556 @@
-import logging
-import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from collections import defaultdict, Counter
-import random
-from typing import Dict, List, Tuple, Optional, Set
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+import pyarrow.parquet as pq
+from tqdm import tqdm
+import os
+import json
+from collections import Counter
 
-# Constants
-EPS = 1e-8  # small constant
-
-def binary_collate_fn(batch):
-    """
-    Merges a list of samples into a batch for binary classification.
-    """
-    try:
-        # Extract numerical and categorical features
-        numerical_features = torch.stack([item['numerical_features'] for item in batch])
-        categorical_features = {
-            key: torch.stack([item['categorical_features'][key] for item in batch])
-            for key in batch[0]['categorical_features'].keys()
-        }
-        
-        # Extract other information
-        binary_labels = torch.stack([item['binary_labels'] for item in batch])
-        original_labels = torch.stack([item['original_labels'] for item in batch]) if 'original_labels' in batch[0] else None
-        harq_ids = torch.stack([item['harq_ids'] for item in batch]) if 'harq_ids' in batch[0] else None
-        timestamps = [item['timestamps'] for item in batch]
-        
-        out = {
-            'numerical_features': numerical_features,
-            'categorical_features': categorical_features,
-            'binary_labels': binary_labels,
-            'timestamps': timestamps
-        }
-        
-        if original_labels is not None:
-            out['original_labels'] = original_labels
-        if harq_ids is not None:
-            out['harq_ids'] = harq_ids
-            
-        return out
-    except Exception as e:
-        logging.error(f"Error in binary_collate_fn: {e}")
-        for i, item in enumerate(batch):
-            logging.error(f"Item {i} keys: {item.keys()}")
-        return {}
-
-
-class BinaryAnomalyDataset(Dataset):
-    """
-    Optimized dataset for binary anomaly detection with hybrid feature modeling
-    """
-    def __init__(self,
-                 parquet_path: str,
-                 feature_columns: list,
-                 seq_len: int,
-                 stride: int = None,
-                 ratio: float = 1.0,
-                 seed: int = 42,
-                 normalization_stats: dict = None,
-                 pre_normalize: bool = True,
-                 use_state_cache: bool = True,
-                 overlap_ratio: float = 0.5,
-                 keep_original_labels: bool = True,
-                 max_samples: int = None,
-                 transform=None):
-        """
-        Dataset for binary anomaly detection with hybrid feature modeling.
-        
-        Args:
-            parquet_path: Path to the parquet file
-            feature_columns: List of column names to use as features
-            seq_len: Length of each sequence
-            stride: Stride between sequences (default: seq_len * (1-overlap_ratio))
-            ratio: Portion of data to use (1.0 = all data)
-            seed: Random seed for reproducibility
-            normalization_stats: Dictionary with 'means' and 'stds' for numerical features
-            pre_normalize: If True, normalize numerical features at load time
-            use_state_cache: If True, track state between sequences for each HARQ ID
-            overlap_ratio: Amount of overlap between sequences (0.0 to 1.0)
-            keep_original_labels: Keep original multi-class labels for reporting
-            max_samples: Maximum number of samples to load (for testing)
-            transform: Optional transform to apply to sequences
-        """
-        super().__init__()
+class AnomalySequenceDataset(Dataset):
+    def __init__(
+        self, 
+        parquet_path,
+        numerical_features,
+        categorical_features,
+        categorical_dims,
+        seq_len=50,
+        sample_files=None,
+        sample_fraction=1.0,
+        normalization_stats=None,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        is_training=True  # New parameter to distinguish training vs evaluation
+    ):
         self.parquet_path = parquet_path
-        self.feature_columns = feature_columns
+        self.numerical_features = numerical_features
+        self.categorical_features = categorical_features
+        self.categorical_dims = categorical_dims
+        self.feature_columns = numerical_features + categorical_features
         self.seq_len = seq_len
-        self.overlap_ratio = overlap_ratio
-        self.stride = stride if stride is not None else max(1, int(seq_len * (1 - overlap_ratio)))
         self.normalization_stats = normalization_stats
-        self.pre_normalize = pre_normalize
-        self.use_state_cache = use_state_cache
-        self.keep_original_labels = keep_original_labels
-        self.max_samples = max_samples
-        self.transform = transform
+        self.device = device
+        self.is_training = is_training  # Store mode flag
         
-        # Define categorical and numerical features
-        self.categorical_features = ['HARQ', 'CRC', 'NDI']
-        self.numerical_features = ['SFN', 'Slot', 'MCS', 'ReTx']
-        
-        # Define mapping for anomaly labels (keep for reporting)
-        self.anomaly_mapping = {
+        # Anomaly mapping for faster label conversion
+        self.ANOMALY_MAPPING = {
             "unnecessary_retx": 1,
             "missing_retx": 2,
             "new_data_no_retx": 3,
             "max_retx_achieved": 4,
         }
         
-        # Inverse mapping for reporting
-        self.inverse_anomaly_mapping = {v: k for k, v in self.anomaly_mapping.items()}
-        self.inverse_anomaly_mapping[0] = "normal"
+        # Get file IDs to process
+        self.file_ids = self.getfile_ids(sample_files, sample_fraction)
+        
+        # Prepare sequences
+        self.sequences = []
+        self.labels = []
+        self.timestamps = []
+        
+        # Anomaly counters
+        self.anomaly_counts = Counter()
+        self.normal_count = 0
+        
+        # Create sequences
+        self._create_sequences()
+    
+    def getfile_ids(self, sample_files, sample_fraction):
+        """Get the file IDs to process using PyArrow directly"""
+        # Read all file IDs from the parquet file
+        table = pq.read_table(self.parquet_path, columns=['file_id'])
+        unique_file_ids = np.unique(table['file_id'].to_numpy())
 
-        # Load data and prepare sequences
-        self._load_data(ratio, seed)
-        self._prepare_sequences()
-        self._report_class_counts()
-        
-        # Create state cache for HARQ IDs
-        self.harq_state_cache = {} if use_state_cache else None
-        
-        # Map sequences to their HARQ IDs for efficient retrieval
-        self._map_sequences_to_harq()
+        # Sample files if needed
+        if sample_files is not None:
+            return sample_files
 
-    def _load_data(self, ratio, seed):
-        """Load data from the parquet file with hybrid feature processing and optimized loading"""
-        logging.info(f"Loading data from {self.parquet_path}")
+        # Randomly sample a fraction of files for training
+        if sample_fraction < 1.0:
+            np.random.seed(42)  # For reproducibility
+            sampled_files = np.random.choice(
+                unique_file_ids, 
+                size=int(len(unique_file_ids) * sample_fraction),
+                replace=False
+            )
+            return sampled_files
+
+        return unique_file_ids
+    
+    def insight_to_label(self, insights):
+        """Convert batch of insights to labels using torch operations"""
+        # Convert insights to a list if it's a numpy array
+        if isinstance(insights, np.ndarray):
+            insights = insights.tolist()
         
-        try:
-            # Only load required columns to save memory
-            columns_to_load = self.feature_columns + ['file_id', 'insight', 'timestamp_str']
+        labels = []
+        for insight in insights:
+            if not insight or isinstance(insight, float):  # Check for None, empty string, or NaN
+                labels.append(0)
+                continue
+                
+            # Parse anomalies from the insight string
+            anomalies = [a.strip() for a in insight.split(",") if a.strip()]
+            if not anomalies:
+                labels.append(0)
+                continue
+                
+            # Special case: remove max_retx_achieved if other anomalies exist
+            if len(anomalies) > 1 and "max_retx_achieved" in anomalies:
+                anomalies = [a for a in anomalies if a != "max_retx_achieved"]
+
+            # Get valid anomaly labels
+            valid_labels = [self.ANOMALY_MAPPING.get(a) for a in anomalies if a in self.ANOMALY_MAPPING]
+
+            # Return 0 if no valid anomalies
+            if not valid_labels:
+                labels.append(0)
+            else:
+                # Return the smallest valid label
+                labels.append(min(valid_labels))
+                
+        return torch.tensor(labels, dtype=torch.long)
+    
+    def normalize_data(self, data, columns):
+        """Normalize numerical data using torch operations"""
+        if self.normalization_stats is None:
+            return data
             
-            # Optimize loading by sampling at the file level if ratio < 1.0
-            if ratio < 1.0:
-                # First load only file_id to get unique file IDs
-                df_ids = pd.read_parquet(self.parquet_path, columns=['file_id'])
-                unique_file_ids = df_ids['file_id'].unique()
-                
-                np.random.seed(seed)
-                num_files = max(1, int(len(unique_file_ids) * ratio))
-                sampled_files = np.random.choice(unique_file_ids, num_files, replace=False)
-                
-                # Then load only sampled files and required columns
-                self.df = pd.read_parquet(
-                    self.parquet_path,
-                    columns=columns_to_load,
-                    filters=[('file_id', 'in', sampled_files.tolist())]
+        means = torch.tensor(self.normalization_stats['means'], device=data.device)
+        stds = torch.tensor(self.normalization_stats['stds'], device=data.device)
+        
+        # Get the indices of columns to normalize
+        norm_cols = ['SFN', 'Slot', 'MCS', 'ReTx']
+        indices = [columns.index(col) for col in norm_cols if col in columns]
+        
+        # Normalize only the specified columns
+        normalized_data = data.clone()
+        for i, idx in enumerate(indices):
+            normalized_data[:, idx] = (data[:, idx] - means[i]) / stds[i]
+            
+        return normalized_data
+    
+    def _create_sequences(self):
+        """Create sequences from all files using PyArrow and torch operations"""
+        print(f"Creating sequences from {len(self.file_ids)} files...")
+        
+        for file_id in tqdm(self.file_ids, desc="Processing files"):
+            # Read data for this file_id using PyArrow
+            table = pq.read_table(
+                self.parquet_path, 
+                filters=[('file_id', '==', file_id)]
+            )
+            
+            # Convert to numpy arrays for faster processing
+            all_columns = table.column_names
+            data_dict = {col: table[col].to_numpy() for col in all_columns}
+            
+            # Create tensors for numerical and categorical features
+            numerical_data = torch.tensor(
+                np.column_stack([data_dict[col] for col in self.numerical_features]), 
+                dtype=torch.float32
+            )
+            
+            categorical_data = torch.tensor(
+                np.column_stack([data_dict[col] for col in self.categorical_features]), 
+                dtype=torch.long
+            )
+            
+            # Normalize numerical data
+            numerical_data = self.normalize_data(numerical_data, self.numerical_features)
+            
+            # Convert insights to labels
+            labels = self.insight_to_label(data_dict['insight'])
+            
+            # Count normal timesteps
+            self.normal_count += (labels == 0).sum().item()
+            
+            # Count anomalies by type
+            for label in range(1, 5):
+                self.anomaly_counts[label] += (labels == label).sum().item()
+            
+            # Check if we're creating sequences for training or evaluation
+            if self.is_training:
+                self._process_file_training(
+                    numerical_data, 
+                    categorical_data, 
+                    labels, 
+                    data_dict['timestamp_str']
                 )
             else:
-                # Load only required columns
-                self.df = pd.read_parquet(self.parquet_path, columns=columns_to_load)
-            
-            # Apply max_samples limit if specified
-            if self.max_samples is not None and len(self.df) > self.max_samples:
-                self.df = self.df.sample(self.max_samples, random_state=seed)
-                
-            # Ensure required columns exist
-            if 'insight' not in self.df.columns:
-                self.df['insight'] = ""
-            
-            if 'timestamp_str' not in self.df.columns:
-                self.df['timestamp_str'] = ["" for _ in range(len(self.df))]
-                
-            # Extract HARQ ID for state tracking with safety checks
-            harq_values = []
-            if 'HARQ' in self.df.columns:
-                harq_values = self.df['HARQ'].values
-            elif 'HARQ_ID' in self.df.columns:
-                harq_values = self.df['HARQ_ID'].values
-            else:
-                # If HARQ ID not available, use row index
-                harq_values = np.arange(len(self.df))
-            
-            # Ensure HARQ values are valid integers within a reasonable range
-            harq_values = np.clip(harq_values, 0, 15)  # Assuming max 16 HARQ IDs (0-15)
-            self.df['harq_id'] = harq_values
-            
-            # Process original multi-class labels
-            original_labels = []
-            for insight in self.df['insight']:
-                label = self.insight_to_label(insight)
-                original_labels.append(label)
-            
-            self.original_labels = torch.tensor(original_labels, dtype=torch.long)
-            
-            # Convert to binary labels (0: normal, 1: anomaly)
-            self.binary_labels = (self.original_labels != 0).long()
-            
-            # Process numerical features
-            numerical_data = self.df[self.numerical_features].values
-            numerical_data = np.nan_to_num(numerical_data, nan=0.0)
-            
-            # Normalize numerical features if requested
-            if self.normalization_stats and self.pre_normalize:
-                means = self.normalization_stats.get('means')
-                stds = self.normalization_stats.get('stds')
-                
-                # Validate stats dimensions
-                if means is not None and stds is not None:
-                    # Make sure stats match feature dimensions
-                    if len(means) != numerical_data.shape[1]:
-                        logging.warning(f"Feature stats mismatch: got {len(means)} means but have {numerical_data.shape[1]} numerical features")
-                        means = means[:numerical_data.shape[1]] if len(means) > numerical_data.shape[1] else means + [0.0] * (numerical_data.shape[1] - len(means))
-                    
-                    if len(stds) != numerical_data.shape[1]:
-                        logging.warning(f"Feature stats mismatch: got {len(stds)} stds but have {numerical_data.shape[1]} numerical features")
-                        stds = stds[:numerical_data.shape[1]] if len(stds) > numerical_data.shape[1] else stds + [1.0] * (numerical_data.shape[1] - len(stds))
-                    
-                    # Apply normalization
-                    numerical_data = (numerical_data - np.array(means)) / (np.array(stds) + EPS)
-                else:
-                    logging.warning("Missing normalization stats, skipping normalization")
-            
-            self.numerical_features_tensor = torch.tensor(numerical_data, dtype=torch.float32)
-            
-            # Process categorical features (no normalization)
-            self.categorical_features_tensors = {}
-            for feature in self.categorical_features:
-                if feature in self.df.columns:
-                    feature_values = self.df[feature].values
-                    feature_values = np.clip(feature_values, 0, self._get_max_value(feature))
-                    self.categorical_features_tensors[feature] = torch.tensor(feature_values, dtype=torch.long)
-                else:
-                    logging.warning(f"Categorical feature {feature} not found in dataframe")
-                    # Create a dummy tensor with zeros
-                    self.categorical_features_tensors[feature] = torch.zeros(len(self.df), dtype=torch.long)
-                    
-            # Store timestamps and HARQ IDs
-            self.timestamps = self.df['timestamp_str'].tolist()
-            self.harq_ids = torch.tensor(self.df['harq_id'].values, dtype=torch.long)
-            
-            logging.info(f"Loaded {len(self.df)} rows from the dataset")
-        
-        except Exception as e:
-            logging.error(f"Error loading data: {e}")
-            # Create empty datasets to prevent further errors
-            self.df = pd.DataFrame(columns=self.feature_columns + ['file_id', 'insight', 'timestamp_str', 'harq_id'])
-            self.numerical_features_tensor = torch.zeros((0, len(self.numerical_features)), dtype=torch.float32)
-            self.categorical_features_tensors = {feature: torch.zeros(0, dtype=torch.long) for feature in self.categorical_features}
-            self.original_labels = torch.zeros(0, dtype=torch.long)
-            self.binary_labels = torch.zeros(0, dtype=torch.long)
-            self.timestamps = []
-            self.harq_ids = torch.zeros(0, dtype=torch.long)
-            logging.warning("Created empty dataset due to loading error")
-        
-    def _get_max_value(self, feature):
-        """Get maximum valid value for categorical feature"""
-        if feature == 'HARQ':
-            return 15  # 16 possible HARQ IDs (0-15)
-        elif feature == 'CRC':
-            return 1   # Binary (0-1)
-        elif feature == 'NDI':
-            return 1   # Binary (0-1)
-        else:
-            return 100  # Default for safety
-
-    def _prepare_sequences(self):
-        """Pre-compute all valid sequence indices with overlap between sequences"""
-        self.sequences = []
-        
-        try:
-            # Group by file_id to ensure sequences come from the same file
-            for _, group_indices in self.df.groupby('file_id').groups.items():
-                indices = list(group_indices)
-                num_rows = len(indices)
-                
-                if num_rows < self.seq_len:
-                    continue
-                
-                # Generate valid sequence indices with proper overlap
-                for start_idx in range(0, num_rows - self.seq_len + 1, self.stride):
-                    seq_indices = indices[start_idx:start_idx + self.seq_len]
-                    
-                    # Store sequence information
-                    self.sequences.append({
-                        'indices': seq_indices,
-                        'start_idx': start_idx,
-                        'file_id': self.df.iloc[seq_indices[0]]['file_id'] if len(seq_indices) > 0 else None
-                    })
-                    
-            logging.info(f"Generated {len(self.sequences)} sequences")
-        
-        except Exception as e:
-            logging.error(f"Error preparing sequences: {e}")
-            self.sequences = []
-            logging.warning("Created empty sequences list due to error")
-
-    def _map_sequences_to_harq(self):
-        """Create mappings for efficient sequence retrieval by HARQ ID"""
-        self.harq_to_sequences = defaultdict(list)
-        self.seq_to_harq_ids = {}
-        
-        try:
-            for seq_idx, seq_info in enumerate(self.sequences):
-                indices = seq_info['indices']
-                if len(indices) == 0 or seq_idx >= len(self.harq_ids):
-                    continue
-                    
-                harq_ids = self.harq_ids[indices].unique().tolist()
-                
-                self.seq_to_harq_ids[seq_idx] = harq_ids
-                for harq_id in harq_ids:
-                    self.harq_to_sequences[harq_id].append(seq_idx)
-                    
-            logging.info(f"Mapped {len(self.harq_to_sequences)} unique HARQ IDs to sequences")
-        
-        except Exception as e:
-            logging.error(f"Error mapping sequences to HARQ IDs: {e}")
-            self.harq_to_sequences = defaultdict(list)
-            self.seq_to_harq_ids = {}
-            logging.warning("Created empty HARQ mappings due to error")
-
-    def insight_to_label(self, insight):
-        """Convert insight string to integer label"""
-        if pd.isna(insight) or insight.strip() == "":
-            return 0
-
-        # Parse anomalies from the insight string
-        anomalies = [a.strip() for a in insight.split(",") if a.strip()]
-        if not anomalies:
-            return 0
-
-        # Special case: remove max_retx_achieved if other anomalies exist
-        if len(anomalies) > 1 and "max_retx_achieved" in anomalies:
-            anomalies = [a for a in anomalies if a != "max_retx_achieved"]
-        
-        # Get valid anomaly labels
-        valid_labels = [self.anomaly_mapping.get(a) for a in anomalies 
-                        if a in self.anomaly_mapping]
-        
-        # Return 0 if no valid anomalies
-        if not valid_labels:
-            return 0
-            
-        # Return the smallest valid label
-        return min(valid_labels)
+                self._process_file_evaluation(
+                    numerical_data, 
+                    categorical_data, 
+                    labels, 
+                    data_dict['timestamp_str']
+                )
     
-    def _report_class_counts(self):
-        """Report class distribution in the dataset"""
-        try:
-            # Binary label distribution
-            binary_unique, binary_counts = torch.unique(self.binary_labels, return_counts=True)
-            
-            logging.info("Binary class distribution in the dataset:")
-            self.binary_counts = {label.item(): count.item() 
-                                for label, count in zip(binary_unique, binary_counts)}
-            
-            for label, count in self.binary_counts.items():
-                label_name = "normal" if label == 0 else "anomaly"
-                logging.info(f"  {label} ({label_name}): {count}")
-            
-            # Original multi-class distribution (for reporting)
-            original_unique, original_counts = torch.unique(self.original_labels, return_counts=True)
-            
-            logging.info("Original class distribution in the dataset:")
-            self.original_counts = {label.item(): count.item() 
-                                   for label, count in zip(original_unique, original_counts)}
-            
-            for label, count in self.original_counts.items():
-                label_name = self.inverse_anomaly_mapping.get(label, "unknown")
-                logging.info(f"  {label} ({label_name}): {count}")
-                
-            # Store sequence-level class counts
-            self.seq_normal_count = 0
-            self.seq_anomaly_count = 0
-            
-            for seq_info in self.sequences:
-                seq_indices = seq_info['indices']
-                if len(seq_indices) == 0:
-                    continue
-                    
-                seq_binary_labels = self.binary_labels[seq_indices]
-                
-                # A sequence is considered anomalous if it contains any anomaly
-                if torch.any(seq_binary_labels == 1):
-                    self.seq_anomaly_count += 1
-                else:
-                    self.seq_normal_count += 1
-                    
-            logging.info(f"Sequence-level binary distribution: Normal: {self.seq_normal_count}, Anomaly: {self.seq_anomaly_count}")
+    def _process_file_training(self, numerical_data, categorical_data, labels, timestamps):
+        """Process a single file to create sequences for training with anomaly-centered approach"""
+        # Find anomaly indices (label != 0)
+        anomaly_indices = torch.nonzero(labels != 0, as_tuple=True)[0]
         
-        except Exception as e:
-            logging.error(f"Error reporting class counts: {e}")
-            self.binary_counts = {0: 0, 1: 0}
-            self.original_counts = {0: 0}
-            self.seq_normal_count = 0
-            self.seq_anomaly_count = 0
-            logging.warning("Created default class counts due to error")
-
-    def _normalize_numerical(self, features):
-        """Normalize numerical features on-the-fly if not pre-normalized"""
-        if not self.normalization_stats or self.pre_normalize:
-            return features
-
-        try:
-            means = self.normalization_stats.get('means')
-            stds = self.normalization_stats.get('stds')
+        # Process sequences centered around anomalies
+        for idx in anomaly_indices:
+            idx = idx.item()
+            label = labels[idx].item()
             
-            if means is None or stds is None:
-                return features
+            # Get sequence start index (considering previous seq_len-1 timesteps)
+            start_idx = max(0, idx - (self.seq_len - 1))
+            
+            # Extract sequence - this includes the anomaly point
+            num_seq = numerical_data[start_idx:(idx + 1)]
+            cat_seq = categorical_data[start_idx:(idx + 1)]
+            seq_labels = labels[start_idx:(idx + 1)]
+            
+            # Extract sequence timestamps - one for each timestep
+            seq_timestamps = timestamps[start_idx:(idx + 1)].tolist()
+            
+            # If sequence is shorter than seq_len, pad with zeros
+            if len(num_seq) < self.seq_len:
+                # Create padding tensors
+                pad_length = self.seq_len - len(num_seq)
                 
-            # Make sure stats match feature dimensions
-            if len(means) != features.shape[-1]:
-                means = means[:features.shape[-1]] if len(means) > features.shape[-1] else means + [0.0] * (features.shape[-1] - len(means))
+                num_padding = torch.zeros(pad_length, len(self.numerical_features), dtype=torch.float32)
+                cat_padding = torch.zeros(pad_length, len(self.categorical_features), dtype=torch.long)
+                label_padding = torch.zeros(pad_length, dtype=torch.long)
+                
+                # Pad timestamps with empty strings
+                timestamp_padding = [""] * pad_length
+                
+                # Combine padding with actual sequence
+                num_seq = torch.cat([num_padding, num_seq], dim=0)
+                cat_seq = torch.cat([cat_padding, cat_seq], dim=0)
+                seq_labels = torch.cat([label_padding, seq_labels], dim=0)
+                seq_timestamps = timestamp_padding + seq_timestamps
             
-            if len(stds) != features.shape[-1]:
-                stds = stds[:features.shape[-1]] if len(stds) > features.shape[-1] else stds + [1.0] * (features.shape[-1] - len(stds))
-            
-            if not torch.is_tensor(means):
-                means = torch.tensor(means, dtype=torch.float32, device=features.device)
-            if not torch.is_tensor(stds):
-                stds = torch.tensor(stds, dtype=torch.float32, device=features.device)
+            # Store sequence, label and timestamp
+            self.sequences.append((num_seq, cat_seq))
+            self.labels.append(seq_labels)
+            self.timestamps.append(seq_timestamps)
+        
+        # Add sequences with only normal labels
+        # Only create normal sequences if there are enough normal timesteps
+        if len(labels) >= self.seq_len:
+            self._add_normal_sequences(
+                numerical_data, categorical_data, labels, timestamps
+            )
 
-            return (features.float() - means) / (stds + EPS)
+    def _add_normal_sequences(self, numerical_data, categorical_data, labels, timestamps):
+        """Add sequences that only consist of normal labels"""
+        # Find continuous chunks of normal (label=0) points
+        normal_mask = labels == 0
+        
+        # Convert to numpy for easier processing of continuous chunks
+        normal_indices = torch.nonzero(normal_mask, as_tuple=True)[0].numpy()
+        
+        # Find continuous chunks
+        if len(normal_indices) > 0:
+            # Split into continuous chunks
+            chunks = np.split(normal_indices, np.where(np.diff(normal_indices) != 1)[0] + 1)
             
-        except Exception as e:
-            logging.error(f"Error in normalization: {e}")
-            return features
+            # Filter chunks that are long enough
+            valid_chunks = [chunk for chunk in chunks if len(chunk) >= self.seq_len]
+            
+            # Determine how many normal sequences to add based on the anomaly distribution
+            # Based on your statistics, normal sequences should be about 15% of anomaly sequences
+            # to maintain a reasonable balance
+            anomaly_count = len(self.sequences)
+            target_normal_count = min(int(anomaly_count * 0.15), len(valid_chunks))
+            
+            if target_normal_count > 0 and valid_chunks:
+                # Randomly select chunks to sample from
+                np.random.seed(42)  # For reproducibility
+                selected_chunks = np.random.choice(
+                    len(valid_chunks), 
+                    size=min(target_normal_count, len(valid_chunks)),
+                    replace=False
+                )
+                
+                for chunk_idx in selected_chunks:
+                    chunk = valid_chunks[chunk_idx]
+                    
+                    # Select a random starting point that allows a full sequence
+                    if len(chunk) > self.seq_len:
+                        start_pos = np.random.randint(0, len(chunk) - self.seq_len + 1)
+                        chunk = chunk[start_pos:start_pos + self.seq_len]
+                    
+                    # Extract sequence
+                    num_seq = numerical_data[chunk]
+                    cat_seq = categorical_data[chunk]
+                    seq_labels = labels[chunk]
+                    seq_timestamps = [timestamps[i] for i in chunk]
+                    
+                    # Store sequence
+                    self.sequences.append((num_seq, cat_seq))
+                    self.labels.append(seq_labels)
+                    self.timestamps.append(seq_timestamps)
 
-    def get_harq_state(self, harq_id):
-        """Get cached state for a given HARQ ID"""
-        if not self.use_state_cache or harq_id not in self.harq_state_cache:
-            return None
-        return self.harq_state_cache[harq_id]
+    def _process_file_evaluation(self, numerical_data, categorical_data, labels, timestamps):
+        """Process a single file to create non-overlapping sequences for evaluation"""
+        # For evaluation, we create non-overlapping sequences covering the entire dataset
+        total_length = len(numerical_data)
+        
+        # Process full sequences
+        for start_idx in range(0, total_length, self.seq_len):
+            end_idx = min(start_idx + self.seq_len, total_length)
+            
+            # Skip if the sequence is too short
+            if end_idx - start_idx < self.seq_len:
+                # Create a sequence that includes the remaining data
+                start_idx = max(0, total_length - self.seq_len)
+                end_idx = total_length
+                
+                # Skip if we've already processed this range
+                if start_idx < (total_length - self.seq_len):
+                    continue
+            
+            # Extract sequence
+            num_seq = numerical_data[start_idx:end_idx]
+            cat_seq = categorical_data[start_idx:end_idx]
+            seq_labels = labels[start_idx:end_idx]
+            seq_timestamps = timestamps[start_idx:end_idx].tolist()
+            
+            # If sequence is shorter than seq_len, pad with zeros
+            if len(num_seq) < self.seq_len:
+                # Create padding tensors
+                pad_length = self.seq_len - len(num_seq)
+                
+                num_padding = torch.zeros(pad_length, len(self.numerical_features), dtype=torch.float32)
+                cat_padding = torch.zeros(pad_length, len(self.categorical_features), dtype=torch.long)
+                label_padding = torch.zeros(pad_length, dtype=torch.long)
+                
+                # Pad timestamps with empty strings
+                timestamp_padding = [""] * pad_length
+                
+                # Combine padding with actual sequence
+                num_seq = torch.cat([num_seq, num_padding], dim=0)  # Padding at the end for evaluation
+                cat_seq = torch.cat([cat_seq, cat_padding], dim=0)
+                seq_labels = torch.cat([seq_labels, label_padding], dim=0)
+                seq_timestamps = seq_timestamps + timestamp_padding
+            
+            # Store sequence, label and timestamp
+            self.sequences.append((num_seq, cat_seq))
+            self.labels.append(seq_labels)
+            self.timestamps.append(seq_timestamps)
     
-    def update_harq_state(self, harq_id, state):
-        """Update cached state for a given HARQ ID"""
-        if self.use_state_cache:
-            self.harq_state_cache[harq_id] = state
-
-    def __getitem__(self, index):
-        """Get a sequence by index with hybrid feature processing"""
-        try:
-            if index >= len(self.sequences):
-                raise IndexError(f"Index {index} out of bounds for dataset with {len(self.sequences)} sequences")
-                
-            seq_info = self.sequences[index]
-            seq_indices = seq_info['indices']
-            
-            if len(seq_indices) == 0:
-                raise ValueError(f"Empty sequence at index {index}")
-            
-            # Get numerical features
-            seq_numerical = self.numerical_features_tensor[seq_indices]
-            
-            # Normalize if needed and not already done
-            if self.normalization_stats and not self.pre_normalize:
-                seq_numerical = self._normalize_numerical(seq_numerical)
-            
-            # Get categorical features
-            seq_categorical = {
-                feature: self.categorical_features_tensors[feature][seq_indices]
-                for feature in self.categorical_features
-            }
-            
-            # Get binary labels
-            seq_binary_labels = self.binary_labels[seq_indices]
-            
-            # Get original labels for reporting if needed
-            seq_original_labels = self.original_labels[seq_indices] if self.keep_original_labels else None
-            
-            # Get timestamps and HARQ IDs
-            seq_timestamps = [self.timestamps[i] for i in seq_indices]
-            seq_harq_ids = self.harq_ids[seq_indices]
-            
-            # Apply transform if provided
-            if self.transform is not None:
-                seq_numerical = self.transform(seq_numerical)
-            
-            result = {
-                'numerical_features': seq_numerical,
-                'categorical_features': seq_categorical,
-                'binary_labels': seq_binary_labels,
-                'timestamps': seq_timestamps,
-                'harq_ids': seq_harq_ids,
-                'index': index
-            }
-            
-            if seq_original_labels is not None:
-                result['original_labels'] = seq_original_labels
-                
-            return result
-            
-        except Exception as e:
-            logging.error(f"Error getting item at index {index}: {e}")
-            # Return a default item to prevent crashes
-            default_numerical = torch.zeros((self.seq_len, len(self.numerical_features)), dtype=torch.float32)
-            default_categorical = {
-                feature: torch.zeros(self.seq_len, dtype=torch.long)
-                for feature in self.categorical_features
-            }
-            default_binary = torch.zeros(self.seq_len, dtype=torch.long)
-            default_original = torch.zeros(self.seq_len, dtype=torch.long) if self.keep_original_labels else None
-            default_timestamps = ["" for _ in range(self.seq_len)]
-            default_harq_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            
-            result = {
-                'numerical_features': default_numerical,
-                'categorical_features': default_categorical,
-                'binary_labels': default_binary,
-                'timestamps': default_timestamps,
-                'harq_ids': default_harq_ids,
-                'index': index
-            }
-            
-            if default_original is not None:
-                result['original_labels'] = default_original
-                
-            return result
-
     def __len__(self):
-        """Return the number of sequences"""
-        return max(len(self.sequences), 1)  # Ensure at least 1 to prevent runtime errors
-
-
-def create_balanced_sampler(dataset):
-    """
-    Create a weighted sampler for balanced training
-    """
-    # Calculate weights for each sequence based on whether it contains anomalies
-    weights = []
+        return len(self.sequences)
     
-    if dataset.seq_normal_count == 0 and dataset.seq_anomaly_count == 0:
-        # Empty dataset or error case - use uniform weights
-        return None
-    
-    for seq_idx, seq_info in enumerate(dataset.sequences):
-        indices = seq_info['indices']
-        if len(indices) == 0:
-            weights.append(1.0)
-            continue
-            
-        seq_binary_labels = dataset.binary_labels[indices]
+    def __getitem__(self, idx):
+        numerical_data, categorical_data = self.sequences[idx]
+        labels = self.labels[idx]
+        timestamps = self.timestamps[idx]  # Now a list of timestamps for each timestep
         
-        # Check if sequence contains any anomaly
-        if torch.any(seq_binary_labels == 1):
-            # Anomaly sequence
-            weight = 1.0 / max(1, dataset.seq_anomaly_count)
-        else:
-            # Normal sequence
-            weight = 1.0 / max(1, dataset.seq_normal_count)
-            
-        weights.append(weight)
+        return {
+            'numerical_data': numerical_data,  # Shape: [seq_len, num_features]
+            'categorical_data': categorical_data,  # Shape: [seq_len, cat_features]
+            'label': labels,  # Shape: [seq_len]
+            'timestamp': timestamps  # List of length seq_len
+        }
     
-    # Create weighted sampler
-    return WeightedRandomSampler(
-        weights=weights,
-        num_samples=len(weights),
-        replacement=True
+    def report_statistics(self):
+        """Report dataset statistics"""
+        print("\nDataset Statistics:")
+        print(f"Total sequences: {len(self.sequences)}")
+        
+        if self.is_training:
+            # For training, report anomaly-specific statistics
+            anomaly_sequences = sum(1 for seq_labels in self.labels if torch.any(seq_labels != 0))
+            normal_sequences = len(self.sequences) - anomaly_sequences
+            
+            print(f"Anomaly sequences: {anomaly_sequences}")
+            print(f"Normal-only sequences: {normal_sequences}")
+        
+        print(f"Normal timesteps: {self.normal_count}")
+        
+        # Count the number of instances with each label in the sequences
+        zero_label_count = sum((seq_labels == 0).sum().item() for seq_labels in self.labels)
+        one_label_count = sum((seq_labels == 1).sum().item() for seq_labels in self.labels)
+        two_label_count = sum((seq_labels == 2).sum().item() for seq_labels in self.labels)
+        three_label_count = sum((seq_labels == 3).sum().item() for seq_labels in self.labels)
+        four_label_count = sum((seq_labels == 4).sum().item() for seq_labels in self.labels)
+        
+        total_elements = sum(len(seq_labels) for seq_labels in self.labels)
+        
+        print(f"Instances with label 0 in sequences: {zero_label_count} ({zero_label_count / total_elements:.2%})")
+        print(f"Instances with label 1 in sequences: {one_label_count} ({one_label_count / total_elements:.2%})")
+        print(f"Instances with label 2 in sequences: {two_label_count} ({two_label_count / total_elements:.2%})")
+        print(f"Instances with label 3 in sequences: {three_label_count} ({three_label_count / total_elements:.2%})")
+        print(f"Instances with label 4 in sequences: {four_label_count} ({four_label_count / total_elements:.2%})")
+        
+        print("Anomaly counts:")
+        anomaly_names = {
+            1: "unnecessary_retx",
+            2: "missing_retx",
+            3: "new_data_no_retx",
+            4: "max_retx_achieved"
+        }
+        
+        for label, count in sorted(self.anomaly_counts.items()):
+            print(f"  - {anomaly_names[label]} (label {label}): {count}")
+        
+        # Calculate class weights
+        class_counts = torch.tensor([
+            zero_label_count,
+            one_label_count,
+            two_label_count,
+            three_label_count,
+            four_label_count
+        ], dtype=torch.float)
+        
+        total_samples = class_counts.sum()
+        num_classes = len(class_counts)
+        
+        class_weights = total_samples / (class_counts * num_classes)
+        class_weights[class_counts == 0] = 0.0  # Handle division by zero
+        
+        print("Class weights calculated:")
+        for i in range(num_classes):
+            if i == 0:
+                class_name = "normal"
+            else:
+                class_name = anomaly_names[i]
+            print(f"  - Class {i} ({class_name}): count={class_counts[i]}, weight={class_weights[i]:.4f}")
+        
+        self.class_weights = class_weights
+        
+
+def custom_collate_fn(batch):
+    """
+    Collate function that stacks batch items without moving to device
+    Device transfer should happen in the training loop after pinning
+    """
+    numerical_data = torch.stack([item['numerical_data'] for item in batch])
+    # Shape: [batch_size, seq_len, num_features]
+    
+    categorical_data = torch.stack([item['categorical_data'] for item in batch])
+    # Shape: [batch_size, seq_len, cat_features]
+    
+    labels = torch.stack([item['label'] for item in batch])
+    # Shape: [batch_size, seq_len]
+    
+    # Create a list of lists for timestamps
+    timestamps = [item['timestamp'] for item in batch]
+    # Shape: [batch_size, seq_len] as a list of lists of strings
+    
+    return {
+        'numerical_data': numerical_data,
+        'categorical_data': categorical_data,
+        'label': labels,
+        'timestamp': timestamps
+    }
+
+def create_data_loaders(
+    train_parquet_path='unscaled_pdsch_val.parquet', 
+    test_parquet_path='unscaled_pdsch_val_min.parquet',
+    numerical_features=['SFN', 'Slot', 'MCS', 'ReTx'],
+    categorical_features=['HARQ', 'CRC', 'NDI'],
+    categorical_dims=[16, 2, 2],  # HARQ: 0-15, CRC & NDI: 0-1
+    seq_len=50,
+    batch_size=64,
+    num_workers=min(os.cpu_count(), 4),
+    sample_fraction=1.0,
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+):
+    # Load normalization statistics
+    with open('features_stats.json', 'r') as f:
+        normalization_stats = json.load(f)
+    
+    # Create training dataset
+    print("Creating training dataset...")
+    train_dataset = AnomalySequenceDataset(
+        parquet_path=train_parquet_path,
+        numerical_features=numerical_features,
+        categorical_features=categorical_features,
+        categorical_dims=categorical_dims,
+        seq_len=seq_len,
+        sample_fraction=sample_fraction,
+        normalization_stats=normalization_stats,
+        device=device,
+        is_training=True  # Training mode
     )
-
-
-def create_binary_dataloader(dataset, batch_size, shuffle=True, balance=True, num_workers=4):
-    """
-    Create dataloader with optional balanced sampling
-    """
-    # Safety checks
-    if len(dataset) == 0:
-        logging.warning("Empty dataset provided to dataloader, using default batch size 1")
-        batch_size = 1
-        
-    if balance and shuffle and dataset.seq_normal_count > 0 and dataset.seq_anomaly_count > 0:
-        sampler = create_balanced_sampler(dataset)
-        shuffle = False  # Can't use both shuffle and sampler
-    else:
-        sampler = None
-        
-    return DataLoader(
-        dataset,
+    
+    # Create test dataset with same normalization stats
+    print("Creating test dataset...")
+    test_dataset = AnomalySequenceDataset(
+        parquet_path=test_parquet_path,
+        numerical_features=numerical_features,
+        categorical_features=categorical_features,
+        categorical_dims=categorical_dims,
+        seq_len=seq_len,
+        normalization_stats=normalization_stats,
+        device=device,
+        is_training=False  # Evaluation mode
+    )
+    
+    # Report dataset statistics
+    print("\nTraining dataset:")
+    train_dataset.report_statistics()
+    
+    print("\nTest dataset:")
+    test_dataset.report_statistics()
+    
+    # Create data loaders
+    print(f"\nUsing device: {device}")
+    
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        collate_fn=binary_collate_fn,
+        shuffle=True,  # Shuffle for training
         num_workers=num_workers,
-        pin_memory=True
+        collate_fn=custom_collate_fn,
+        pin_memory=(device == 'cuda')
     )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # No shuffling for evaluation
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=(device == 'cuda')
+    )
+    
+    return train_loader, test_loader, normalization_stats
+
+
+if __name__ == "__main__":
+    # Configuration
+    config = {
+        'train_parquet_path': 'unscaled_pdsch_val.parquet',
+        'test_parquet_path': 'unscaled_pdsch_val_min.parquet',
+        'numerical_features': ['SFN', 'Slot', 'MCS', 'ReTx'],
+        'categorical_features': ['HARQ', 'CRC', 'NDI'],
+        'categorical_dims': [16, 2, 2],  # HARQ: 0-15, CRC & NDI: 0-1
+        'seq_len': 20,
+        'batch_size': 64,
+        'num_workers': min(os.cpu_count(), 4),
+        'sample_fraction': 1.0
+    }
+    
+    # Create data loaders
+    train_loader, test_loader, norm_stats = create_data_loaders(
+        train_parquet_path=config['train_parquet_path'],
+        test_parquet_path=config['test_parquet_path'],
+        numerical_features=config['numerical_features'],
+        categorical_features=config['categorical_features'],
+        categorical_dims=config['categorical_dims'],
+        seq_len=config['seq_len'],
+        batch_size=config['batch_size'],
+        num_workers=config['num_workers'],
+        sample_fraction=config['sample_fraction']
+    )
+    
+    print(f"\nCreated data loaders:")
+    print(f"Training batches: {len(train_loader)}")
+    print(f"Test batches: {len(test_loader)}")
+    
+    # Display a sample batch
+    for batch in train_loader:
+        print("\nSample batch:")
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                print(f"{k}: shape={v.shape}, dtype={v.dtype}")
+            else:
+                print(f"{k}: type={type(v)}, length={len(v)}")
+        break
