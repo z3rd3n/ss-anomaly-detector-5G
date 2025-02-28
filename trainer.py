@@ -346,7 +346,7 @@ class AnomalyTypeLoss(nn.Module):
             # Skip if no instances of this type in the dataset
             if anomaly_type not in self.anomaly_counts or self.anomaly_counts[anomaly_type] == 0:
                 continue
-                
+            
             # Expected count per batch for this type
             expected_count = self.anomaly_counts[anomaly_type] / self.num_batches
             
@@ -360,9 +360,13 @@ class AnomalyTypeLoss(nn.Module):
             # Add component to regularization loss
             # We want to maximize detected_count/expected_count, so we minimize -log(detected/expected)
             if detected_count > 0:
-                type_loss = -torch.log(detected_count / expected_count)
+                type_loss = -torch.log((detected_count + 1e-6) / expected_count)
+
+                # Apply additional weights to anomaly types 2 and 3
+                if anomaly_type in [2, 3]:
+                    type_loss *= 2.0  # Double the weight for types 2 and 3
                 regularization_loss += type_loss
-        
+            
         return regularization_loss
 
 def train_model(
@@ -379,7 +383,7 @@ def train_model(
     regularization_weight=0.5
 ):
     """
-    Train the model with early stopping and learning rate scheduling
+    Train the model with early stopping based on F1 score and log false positives
     """
     # Get anomaly counts from the dataset
     anomaly_counts = train_loader.dataset.anomaly_counts
@@ -395,7 +399,7 @@ def train_model(
     )
     
     # Initialize tracking variables
-    best_val_loss = float('inf')
+    best_val_f1 = 0.0  # Changed from best_val_loss to best_val_f1
     early_stopping_counter = 0
     train_losses = []
     val_losses = []
@@ -460,6 +464,10 @@ def train_model(
         all_binary_preds = []
         all_labels = []
         all_binary_labels = []
+        all_binary_probs = []  # Added to store probabilities
+        all_timestamps = []    # Added to store timestamps
+        all_numerical_data = []  # Added to store numerical data
+        all_norm_stats = test_loader.dataset.normalization_stats  # Get normalization stats
         
         val_progress = tqdm(test_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation")
         
@@ -468,6 +476,7 @@ def train_model(
                 numerical_data = batch['numerical_data'].to(device)
                 categorical_data = batch['categorical_data'].to(device)
                 labels = batch['label'].to(device)
+                timestamps = batch['timestamp']  # Get timestamps
                 
                 # Forward pass
                 outputs = model(numerical_data, categorical_data)
@@ -487,6 +496,9 @@ def train_model(
                 all_binary_preds.append(binary_preds.cpu())
                 all_labels.append(labels.cpu())
                 all_binary_labels.append(binary_labels.cpu())
+                all_binary_probs.append(binary_probs.cpu())  # Store probabilities
+                all_timestamps.append(timestamps)  # Store timestamps
+                all_numerical_data.append(numerical_data.cpu())  # Store numerical data
                 
                 # Track losses
                 val_loss += total_loss.item()
@@ -514,11 +526,14 @@ def train_model(
         all_binary_preds = torch.cat(all_binary_preds, dim=0).numpy()
         all_labels = torch.cat(all_labels, dim=0).numpy()
         all_binary_labels = torch.cat(all_binary_labels, dim=0).numpy()
+        all_binary_probs = torch.cat(all_binary_probs, dim=0).numpy()
+        all_numerical_data = torch.cat(all_numerical_data, dim=0).numpy()
         
         # Flatten for metrics calculation
         all_binary_preds_flat = all_binary_preds.reshape(-1)
         all_labels_flat = all_labels.reshape(-1)
         all_binary_labels_flat = all_binary_labels.reshape(-1)
+        all_binary_probs_flat = all_binary_probs.reshape(-1)
         
         # Calculate binary metrics
         binary_acc = np.mean(all_binary_preds_flat == all_binary_labels_flat)
@@ -537,7 +552,11 @@ def train_model(
         print("                Normal  Anomaly")
         print(f"Actual Normal   {binary_cm[0][0]:<8} {binary_cm[0][1]:<8}")
         print(f"Actual Anomaly  {binary_cm[1][0]:<8} {binary_cm[1][1]:<8}")
-
+        
+        # Log false positives
+        log_false_positives(all_binary_preds, all_binary_labels, all_binary_probs, 
+                           all_numerical_data, all_timestamps, all_norm_stats, epoch)
+        
         # Calculate detection rate by class
         class_names = ['Norm', 'UReTx', 'MReTx', 'NoDReTx', 'MaxReTx']
         print("\nDetection Rate by Class:")
@@ -561,13 +580,13 @@ def train_model(
         if scheduler is not None:
             scheduler.step(val_loss)
         
-        # Check for early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Check for early stopping based on F1 score
+        if binary_f1 > best_val_f1:  # Changed to compare F1 scores instead of loss
+            best_val_f1 = binary_f1
             early_stopping_counter = 0
             # Save the best model
             torch.save(model.state_dict(), 'best_model.pth')
-            print(f"New best model saved with validation loss: {val_loss:.4f}")
+            print(f"New best model saved with validation F1: {binary_f1:.4f}")
         else:
             early_stopping_counter += 1
             print(f"Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
@@ -580,6 +599,67 @@ def train_model(
     model.load_state_dict(torch.load('best_model.pth'))
     
     return model, train_losses, val_losses
+
+def log_false_positives(binary_preds, binary_labels, binary_probs, numerical_data, 
+                       timestamps_list, norm_stats, epoch):
+    """
+    Log all false positives with their features and probabilities
+    """
+    # Create flat list of all timestamps
+    all_timestamps = []
+    for batch_timestamps in timestamps_list:
+        all_timestamps.extend([ts for sublist in batch_timestamps for ts in sublist])
+    
+    # Initialize lists to store false positives
+    fp_timestamps = []
+    fp_probs = []
+    fp_features = []
+    
+    # Get normalization stats for un-normalizing
+    means = np.array(norm_stats['means'])
+    stds = np.array(norm_stats['stds'])
+    
+    # Find all false positives (predicted as anomaly but actually normal)
+    for batch_idx in range(binary_preds.shape[0]):
+        for seq_idx in range(binary_preds.shape[1]):
+            # Check if this is a false positive
+            if binary_preds[batch_idx, seq_idx] == 1 and binary_labels[batch_idx, seq_idx] == 0:
+                # Calculate flattened index to get the timestamp
+                flat_idx = batch_idx * binary_preds.shape[1] + seq_idx
+                
+                # Skip if the timestamp is empty (could be padding)
+                if flat_idx >= len(all_timestamps) or not all_timestamps[flat_idx]:
+                    continue
+                
+                # Add to lists
+                fp_timestamps.append(all_timestamps[flat_idx])
+                fp_probs.append(binary_probs[batch_idx, seq_idx])
+                
+                # Un-normalize the numerical features
+                features = numerical_data[batch_idx, seq_idx]
+                unnormalized_features = features * stds + means
+                
+                # Convert to integers where appropriate
+                int_features = [int(x) if i < 3 else x for i, x in enumerate(unnormalized_features)]
+                
+                fp_features.append(int_features)
+    
+    # Create a dictionary to store unique false positives
+    unique_fps = {}
+    for ts, prob, feat in zip(fp_timestamps, fp_probs, fp_features):
+        if ts not in unique_fps or prob > unique_fps[ts][0]:
+            unique_fps[ts] = (prob, feat)
+    
+    # Sort by probability in descending order
+    sorted_fps = sorted(unique_fps.items(), key=lambda x: x[1][0], reverse=True)
+    
+    # Write to file
+    with open(f'false_positives_epoch_{epoch+1}.csv', 'w') as f:
+        f.write('timestamp,probability,SFN,Slot,MCS,ReTx\n')
+        for ts, (prob, feat) in sorted_fps:
+            f.write(f'{ts},{prob:.6f},{feat[0]},{feat[1]},{feat[2]},{feat[3]:.4f}\n')
+    
+    print(f"\nLogged {len(sorted_fps)} unique false positives to false_positives_epoch_{epoch+1}.csv")
 
 def evaluate_model(
     model,
@@ -695,27 +775,35 @@ def evaluate_model(
     }
 
 if __name__ == "__main__":
-    # Import dataset module
-    from dataset import create_data_loaders
-    
     # Configuration
     config = {
+        # Data paths
         'train_parquet_path': 'unscaled_pdsch_val.parquet',
         'test_parquet_path': 'unscaled_pdsch_val_min.parquet',
+        
+        # Feature configuration
         'numerical_features': ['SFN', 'Slot', 'MCS', 'ReTx'],
         'categorical_features': ['HARQ', 'CRC', 'NDI'],
         'categorical_dims': [16, 2, 2],  # HARQ: 0-15, CRC & NDI: 0-1
+        
+        # Dataset parameters
         'seq_len': 20,
         'batch_size': 64,
         'num_workers': 0 if torch.cuda.is_available() else min(os.cpu_count(), 4),
         'sample_fraction': 0.1,
+        
+        # Model architecture
         'hidden_dim': 128,
         'embedding_dim': 8,
         'num_layers': 2,
         'dropout': 0.3,
+        
+        # Training parameters
         'learning_rate': 0.001,
         'num_epochs': 50,
         'early_stopping_patience': 10,
+        
+        # Loss weights
         'binary_weight': 1.0,
         'reconstruction_weight': 0.5,
         'regularization_weight': 0.3
@@ -723,6 +811,7 @@ if __name__ == "__main__":
     
     # Create data loaders
     print("Creating data loaders...")
+    from dataset import create_data_loaders
     train_loader, test_loader, norm_stats = create_data_loaders(
         train_parquet_path=config['train_parquet_path'],
         test_parquet_path=config['test_parquet_path'],
