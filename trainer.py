@@ -11,25 +11,6 @@ from sklearn.metrics import classification_report, roc_auc_score, confusion_matr
 import os
 import json
 
-class FeatureAttention(nn.Module):
-    """
-    Feature attention mechanism that emphasizes important features.
-    """
-    def __init__(self, feature_dim, hidden_dim=64):
-        super(FeatureAttention, self).__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, feature_dim)
-        )
-        
-    def forward(self, x):
-        # x shape: [batch_size, seq_len, feature_dim]
-        scores = self.attention(x)  # [batch_size, seq_len, feature_dim]
-        attention_weights = F.softmax(scores, dim=2)  # [batch_size, seq_len, feature_dim]
-        attended_features = x * attention_weights
-        return attended_features, attention_weights
-
 class TemporalAttention(nn.Module):
     """
     Temporal attention mechanism to focus on important timesteps.
@@ -51,21 +32,21 @@ class TemporalAttention(nn.Module):
 
 class EmbeddingLayer(nn.Module):
     """
-    Embedding layer for categorical features with learned positional encoding.
+    Embedding layer for all features with learned positional encoding.
     """
-    def __init__(self, categorical_dims, embedding_dim=8, position_encoding=True):
+    def __init__(self, feature_dims, embedding_dim=8, position_encoding=True):
         super(EmbeddingLayer, self).__init__()
         self.embedding_layers = nn.ModuleList([
-            nn.Embedding(dim, embedding_dim) for dim in categorical_dims
+            nn.Embedding(dim, embedding_dim) for dim in feature_dims
         ])
         self.position_encoding = position_encoding
         self.embedding_dim = embedding_dim
         
     def forward(self, x, seq_len):
-        # x shape: [batch_size, seq_len, num_categorical_features]
+        # x shape: [batch_size, seq_len, num_features]
         batch_size, seq_len, num_features = x.size()
         
-        # Apply embedding for each categorical feature
+        # Apply embedding for each feature
         embeddings = []
         for i in range(num_features):
             feature_embedding = self.embedding_layers[i](x[:, :, i])  # [batch_size, seq_len, embedding_dim]
@@ -107,26 +88,26 @@ class AttentionBinaryClassifier(nn.Module):
         self.layer_norm1 = nn.LayerNorm(input_dim)
         self.dropout1 = nn.Dropout(dropout)
         
-        # Layer to incorporate MSE per timestep
-        self.mse_integration = nn.Linear(input_dim + 1, input_dim)  # +1 for MSE
+        # Layer to incorporate reconstruction error per timestep
+        self.error_integration = nn.Linear(input_dim + 1, input_dim)  # +1 for error
         self.layer_norm2 = nn.LayerNorm(input_dim)
         self.dropout2 = nn.Dropout(dropout)
         
         # Output layer
         self.linear = nn.Linear(input_dim, 1)
         
-    def forward(self, x, mse_per_timestep):
+    def forward(self, x, error_per_timestep):
         # Apply self-attention
         attn_output, _ = self.attention(x, x, x)
         x = self.layer_norm1(x + attn_output)  # Residual connection
         x = self.dropout1(x)
         
-        # Incorporate MSE per timestep
-        mse_expanded = mse_per_timestep.unsqueeze(-1)  # [batch_size, seq_len, 1]
-        combined = torch.cat([x, mse_expanded], dim=-1)  # [batch_size, seq_len, input_dim+1]
+        # Incorporate error per timestep
+        error_expanded = error_per_timestep.unsqueeze(-1)  # [batch_size, seq_len, 1]
+        combined = torch.cat([x, error_expanded], dim=-1)  # [batch_size, seq_len, input_dim+1]
         
         # Process combined features
-        x = self.mse_integration(combined)
+        x = self.error_integration(combined)
         x = self.layer_norm2(x)
         x = self.dropout2(x)
         
@@ -135,12 +116,11 @@ class AttentionBinaryClassifier(nn.Module):
 
 class BiGRUAnomalyDetector(nn.Module):
     """
-    BiGRU model for anomaly detection with feature attention and temporal attention mechanisms
+    BiGRU model for anomaly detection with embedding for all features
     """
     def __init__(
         self,
-        numerical_feature_dim,
-        categorical_dims,
+        feature_dims,
         hidden_dim=128,
         embedding_dim=8,
         num_layers=2,
@@ -149,29 +129,22 @@ class BiGRUAnomalyDetector(nn.Module):
     ):
         super(BiGRUAnomalyDetector, self).__init__()
         
-        self.numerical_feature_dim = numerical_feature_dim
-        self.categorical_dims = categorical_dims
+        self.feature_dims = feature_dims
         self.hidden_dim = hidden_dim
         self.embedding_dim = embedding_dim
         self.device = device
         
-        # Define numerical features for evaluation
-        self.numerical_features = ['SFN', 'Slot', 'MCS', 'ReTx']
+        # Define features for reference
+        self.features = ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI']
         
-        # Embedding layer for categorical features
-        self.categorical_embedding = EmbeddingLayer(
-            categorical_dims, 
+        # Embedding layer for all features
+        self.feature_embedding = EmbeddingLayer(
+            feature_dims, 
             embedding_dim=embedding_dim
         )
         
-        # Feature attention for numerical features
-        self.numerical_feature_attention = FeatureAttention(
-            numerical_feature_dim, 
-            hidden_dim=hidden_dim // 2
-        )
-        
-        # Combined input dimension after processing numerical and categorical features
-        self.combined_feature_dim = numerical_feature_dim + len(categorical_dims) * embedding_dim
+        # Combined input dimension after embedding all features
+        self.combined_feature_dim = len(feature_dims) * embedding_dim
         
         # Bidirectional GRU for sequence modeling
         self.gru = nn.GRU(
@@ -189,51 +162,40 @@ class BiGRUAnomalyDetector(nn.Module):
         # Temporal attention for sequence-level context
         self.temporal_attention = TemporalAttention(self.gru_output_dim)
         
-        # Reconstruction layer for numerical features (for the MSE loss)
-        self.reconstruction_layer = nn.Linear(self.gru_output_dim, numerical_feature_dim)
+        # Reconstruction layer for embedded features (for the error loss)
+        self.reconstruction_layer = nn.Linear(self.gru_output_dim, self.combined_feature_dim)
         
         # Binary Classification head using attention
-        # Now takes concatenated gru_output and mse_per_timestep_per_feature
         self.binary_classifier = AttentionBinaryClassifier(
-            input_dim=self.gru_output_dim + numerical_feature_dim,  # Concatenated input
+            input_dim=self.gru_output_dim,
             hidden_dim=hidden_dim,
             dropout=dropout
         )
         
-    def forward(self, numerical_data, categorical_data):
-        # numerical_data: [batch_size, seq_len, numerical_feature_dim]
-        # categorical_data: [batch_size, seq_len, num_categorical_features]
-        batch_size, seq_len, _ = numerical_data.size()
+    def forward(self, feature_data):
+        # feature_data: [batch_size, seq_len, num_features]
+        batch_size, seq_len, _ = feature_data.size()
         
-        # Apply feature attention to numerical data
-        attended_numerical, numerical_attn_weights = self.numerical_feature_attention(numerical_data)
-        
-        # Embed categorical data
-        categorical_embeddings = self.categorical_embedding(categorical_data, seq_len)
-        
-        # Combine features
-        combined_features = torch.cat([attended_numerical, categorical_embeddings], dim=2)
+        # Embed all features
+        embedded_features = self.feature_embedding(feature_data, seq_len)
         
         # Process with bidirectional GRU
-        gru_output, _ = self.gru(combined_features)
+        gru_output, _ = self.gru(embedded_features)
         # gru_output: [batch_size, seq_len, hidden_dim * 2]
         
         # Apply temporal attention for sequence-level context
         context_vector, temporal_attn_weights = self.temporal_attention(gru_output)
         
-        # Reconstruction of numerical data for each timestep
-        numerical_reconstruction = self.reconstruction_layer(gru_output)
+        # Reconstruction of embedded features for each timestep
+        feature_reconstruction = self.reconstruction_layer(gru_output)
         
-        # Calculate reconstruction error for each timestep and each feature
-        mse_per_timestep_per_feature = torch.pow(numerical_data - numerical_reconstruction, 2)  # [B, S, num_features]
-        mse_per_timestep = torch.mean(mse_per_timestep_per_feature, dim=2)  # [B, S]
-        overall_mse = torch.mean(mse_per_timestep, dim=1)  # [B]
-        
-        # Concatenate GRU output with mse_per_timestep_per_feature for binary classification
-        combined_features_for_classification = torch.cat([gru_output, mse_per_timestep_per_feature], dim=2)
+        # Calculate reconstruction error for each timestep
+        reconstruction_error = torch.pow(embedded_features - feature_reconstruction, 2)
+        error_per_timestep = torch.mean(reconstruction_error, dim=2)  # [B, S]
+        overall_error = torch.mean(error_per_timestep, dim=1)  # [B]
         
         # Binary classification for each timestep
-        binary_logits = self.binary_classifier(combined_features_for_classification, mse_per_timestep)
+        binary_logits = self.binary_classifier(gru_output, error_per_timestep)
         binary_probs = torch.sigmoid(binary_logits)
         
         # Calculate instance-level attention for anomaly localization
@@ -242,13 +204,11 @@ class BiGRUAnomalyDetector(nn.Module):
         
         return {
             'gru_output': gru_output,
-            'numerical_reconstruction': numerical_reconstruction,
-            'mse_per_timestep_per_feature': mse_per_timestep_per_feature,
-            'mse_per_timestep': mse_per_timestep,
-            'overall_mse': overall_mse,
+            'feature_reconstruction': feature_reconstruction,
+            'error_per_timestep': error_per_timestep,
+            'overall_error': overall_error,
             'binary_logits': binary_logits,
             'binary_probs': binary_probs,
-            'numerical_attn_weights': numerical_attn_weights,
             'temporal_attn_weights': temporal_attn_weights,
             'instance_attn_weights': instance_attn_weights,
             'context_vector': context_vector
@@ -289,13 +249,13 @@ class AnomalyTypeLoss(nn.Module):
     def forward(self, model_output, labels):
         # Extract components from model output
         binary_logits = model_output['binary_logits']  # [batch_size, seq_len, 1]
-        mse_per_timestep = model_output['mse_per_timestep']  # [batch_size, seq_len]
+        error_per_timestep = model_output['error_per_timestep']  # [batch_size, seq_len]
         
         # Create binary labels from multiclass labels (labels > 0 means anomaly)
         binary_labels = (labels > 0).float()
         
         # 1. Reconstruction Loss
-        reconstruction_loss = torch.mean(mse_per_timestep)
+        reconstruction_loss = torch.mean(error_per_timestep)
         
         # 2. Binary Classification Loss
         binary_logits_flat = binary_logits.reshape(-1, 1)  # [batch_size * seq_len, 1]
@@ -416,12 +376,11 @@ def train_model(
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")
         
         for batch in train_progress:
-            numerical_data = batch['numerical_data'].to(device)
-            categorical_data = batch['categorical_data'].to(device)
+            feature_data = batch['feature_data'].to(device)
             labels = batch['label'].to(device)
             
             # Forward pass
-            outputs = model(numerical_data, categorical_data)
+            outputs = model(feature_data)
             
             # Calculate loss
             loss_dict = criterion(outputs, labels)
@@ -466,20 +425,18 @@ def train_model(
         all_binary_labels = []
         all_binary_probs = []  # Added to store probabilities
         all_timestamps = []    # Added to store timestamps
-        all_numerical_data = []  # Added to store numerical data
-        all_norm_stats = test_loader.dataset.normalization_stats  # Get normalization stats
+        all_feature_data = []  # Added to store feature data
         
         val_progress = tqdm(test_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation")
         
         with torch.no_grad():
             for batch in val_progress:
-                numerical_data = batch['numerical_data'].to(device)
-                categorical_data = batch['categorical_data'].to(device)
+                feature_data = batch['feature_data'].to(device)
                 labels = batch['label'].to(device)
                 timestamps = batch['timestamp']  # Get timestamps
                 
                 # Forward pass
-                outputs = model(numerical_data, categorical_data)
+                outputs = model(feature_data)
                 
                 # Calculate loss
                 loss_dict = criterion(outputs, labels)
@@ -498,7 +455,7 @@ def train_model(
                 all_binary_labels.append(binary_labels.cpu())
                 all_binary_probs.append(binary_probs.cpu())  # Store probabilities
                 all_timestamps.append(timestamps)  # Store timestamps
-                all_numerical_data.append(numerical_data.cpu())  # Store numerical data
+                all_feature_data.append(feature_data.cpu())  # Store feature data
                 
                 # Track losses
                 val_loss += total_loss.item()
@@ -527,7 +484,7 @@ def train_model(
         all_labels = torch.cat(all_labels, dim=0).numpy()
         all_binary_labels = torch.cat(all_binary_labels, dim=0).numpy()
         all_binary_probs = torch.cat(all_binary_probs, dim=0).numpy()
-        all_numerical_data = torch.cat(all_numerical_data, dim=0).numpy()
+        all_feature_data = torch.cat(all_feature_data, dim=0).numpy()
         
         # Flatten for metrics calculation
         all_binary_preds_flat = all_binary_preds.reshape(-1)
@@ -555,7 +512,7 @@ def train_model(
         
         # Log false positives
         log_false_positives(all_binary_preds, all_binary_labels, all_binary_probs, 
-                           all_numerical_data, all_timestamps, all_norm_stats, epoch)
+                           all_feature_data, all_timestamps, model.features, epoch)
         
         # Calculate detection rate by class
         class_names = ['Norm', 'UReTx', 'MReTx', 'NoDReTx', 'MaxReTx']
@@ -600,8 +557,8 @@ def train_model(
     
     return model, train_losses, val_losses
 
-def log_false_positives(binary_preds, binary_labels, binary_probs, numerical_data, 
-                       timestamps_list, norm_stats, epoch):
+def log_false_positives(binary_preds, binary_labels, binary_probs, feature_data, 
+                       timestamps_list, feature_names, epoch):
     """
     Log all false positives with their features and probabilities
     """
@@ -614,10 +571,6 @@ def log_false_positives(binary_preds, binary_labels, binary_probs, numerical_dat
     fp_timestamps = []
     fp_probs = []
     fp_features = []
-    
-    # Get normalization stats for un-normalizing
-    means = np.array(norm_stats['means'])
-    stds = np.array(norm_stats['stds'])
     
     # Find all false positives (predicted as anomaly but actually normal)
     for batch_idx in range(binary_preds.shape[0]):
@@ -635,14 +588,10 @@ def log_false_positives(binary_preds, binary_labels, binary_probs, numerical_dat
                 fp_timestamps.append(all_timestamps[flat_idx])
                 fp_probs.append(binary_probs[batch_idx, seq_idx])
                 
-                # Un-normalize the numerical features
-                features = numerical_data[batch_idx, seq_idx]
-                unnormalized_features = features * stds + means
+                # Get the feature values
+                features = feature_data[batch_idx, seq_idx].tolist()
                 
-                # Convert to integers where appropriate
-                int_features = [int(x) if i < 3 else x for i, x in enumerate(unnormalized_features)]
-                
-                fp_features.append(int_features)
+                fp_features.append(features)
     
     # Create a dictionary to store unique false positives
     unique_fps = {}
@@ -655,9 +604,9 @@ def log_false_positives(binary_preds, binary_labels, binary_probs, numerical_dat
     
     # Write to file
     with open(f'false_positives_epoch_{epoch+1}.csv', 'w') as f:
-        f.write('timestamp,probability,SFN,Slot,MCS,ReTx\n')
+        f.write('timestamp,probability,' + ','.join(feature_names) + '\n')
         for ts, (prob, feat) in sorted_fps:
-            f.write(f'{ts},{prob:.6f},{feat[0]},{feat[1]},{feat[2]},{feat[3]:.4f}\n')
+            f.write(f'{ts},{prob:.6f},' + ','.join(map(str, feat)) + '\n')
     
     print(f"\nLogged {len(sorted_fps)} unique false positives to false_positives_epoch_{epoch+1}.csv")
 
@@ -677,19 +626,17 @@ def evaluate_model(
     all_binary_probs = []
     
     # Track attention weights and reconstruction errors
-    all_numerical_attn = []
     all_temporal_attn = []
     all_instance_attn = []
-    all_mse = []
+    all_errors = []
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating"):
-            numerical_data = batch['numerical_data'].to(device)
-            categorical_data = batch['categorical_data'].to(device)
+            feature_data = batch['feature_data'].to(device)
             labels = batch['label'].to(device)
             
             # Forward pass
-            outputs = model(numerical_data, categorical_data)
+            outputs = model(feature_data)
             
             # Get binary predictions
             binary_probs = outputs['binary_probs'].squeeze(-1)  # [batch_size, seq_len]
@@ -701,10 +648,9 @@ def evaluate_model(
             all_binary_probs.append(binary_probs.cpu())
             
             # Store attention weights and reconstruction errors
-            all_numerical_attn.append(outputs['numerical_attn_weights'].cpu())
             all_temporal_attn.append(outputs['temporal_attn_weights'].cpu())
             all_instance_attn.append(outputs['instance_attn_weights'].cpu())
-            all_mse.append(outputs['mse_per_timestep'].cpu())
+            all_errors.append(outputs['error_per_timestep'].cpu())
     
     # Concatenate all predictions and labels
     all_binary_preds = torch.cat(all_binary_preds, dim=0).numpy()
@@ -753,15 +699,6 @@ def evaluate_model(
         else:
             print(f"Class {i} ({class_names[i]}): 0/0 = 0.00%")
     
-    # Analyze feature attention
-    all_numerical_attn = torch.cat(all_numerical_attn, dim=0)
-    mean_numerical_attn = torch.mean(all_numerical_attn, dim=(0, 1))  # Average over batch and sequence
-    
-    print("\nAverage Feature Attention:")
-    numerical_features = model.numerical_features
-    for i, feature in enumerate(numerical_features):
-        print(f"{feature}: {mean_numerical_attn[i]:.4f}")
-    
     return {
         'binary_accuracy': binary_accuracy,
         'binary_f1': binary_f1,
@@ -770,8 +707,7 @@ def evaluate_model(
         'binary_preds': all_binary_preds,
         'true_labels': all_labels,
         'binary_probs': all_binary_probs,
-        'mean_numerical_attn': mean_numerical_attn.numpy(),
-        'all_mse': [x.numpy() for x in all_mse]
+        'all_errors': [x.numpy() for x in all_errors]
     }
 
 if __name__ == "__main__":
@@ -782,9 +718,8 @@ if __name__ == "__main__":
         'test_parquet_path': 'unscaled_pdsch_val_min.parquet',
         
         # Feature configuration
-        'numerical_features': ['SFN', 'Slot', 'MCS', 'ReTx'],
-        'categorical_features': ['HARQ', 'CRC', 'NDI'],
-        'categorical_dims': [16, 2, 2],  # HARQ: 0-15, CRC & NDI: 0-1
+        'all_features': ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI'],
+        'all_feature_dims': [1024, 31, 16, 33, 2, 9, 2],
         
         # Dataset parameters
         'seq_len': 20,
@@ -812,12 +747,11 @@ if __name__ == "__main__":
     # Create data loaders
     print("Creating data loaders...")
     from dataset import create_data_loaders
-    train_loader, test_loader, norm_stats = create_data_loaders(
+    train_loader, test_loader, _ = create_data_loaders(
         train_parquet_path=config['train_parquet_path'],
         test_parquet_path=config['test_parquet_path'],
-        numerical_features=config['numerical_features'],
-        categorical_features=config['categorical_features'],
-        categorical_dims=config['categorical_dims'],
+        all_features=config['all_features'],
+        all_feature_dims=config['all_feature_dims'],
         seq_len=config['seq_len'],
         batch_size=config['batch_size'],
         num_workers=config['num_workers'],
@@ -829,8 +763,7 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = BiGRUAnomalyDetector(
-        numerical_feature_dim=len(config['numerical_features']),
-        categorical_dims=config['categorical_dims'],
+        feature_dims=config['all_feature_dims'],
         hidden_dim=config['hidden_dim'],
         embedding_dim=config['embedding_dim'],
         num_layers=config['num_layers'],

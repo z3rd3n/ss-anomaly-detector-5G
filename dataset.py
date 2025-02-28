@@ -11,25 +11,20 @@ class AnomalySequenceDataset(Dataset):
     def __init__(
         self, 
         parquet_path,
-        numerical_features,
-        categorical_features,
-        categorical_dims,
+        all_features=['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI'],
+        all_feature_dims=[1024, 31, 16, 33, 2, 9, 2],
         seq_len=50,
         sample_files=None,
         sample_fraction=1.0,
-        normalization_stats=None,
         device='cuda' if torch.cuda.is_available() else 'cpu',
-        is_training=True  # New parameter to distinguish training vs evaluation
+        is_training=True
     ):
         self.parquet_path = parquet_path
-        self.numerical_features = numerical_features
-        self.categorical_features = categorical_features
-        self.categorical_dims = categorical_dims
-        self.feature_columns = numerical_features + categorical_features
+        self.all_features = all_features
+        self.all_feature_dims = all_feature_dims
         self.seq_len = seq_len
-        self.normalization_stats = normalization_stats
         self.device = device
-        self.is_training = is_training  # Store mode flag
+        self.is_training = is_training
         
         # Anomaly mapping for faster label conversion
         self.ANOMALY_MAPPING = {
@@ -110,25 +105,6 @@ class AnomalySequenceDataset(Dataset):
                 
         return torch.tensor(labels, dtype=torch.long)
     
-    def normalize_data(self, data, columns):
-        """Normalize numerical data using torch operations"""
-        if self.normalization_stats is None:
-            return data
-            
-        means = torch.tensor(self.normalization_stats['means'], device=data.device)
-        stds = torch.tensor(self.normalization_stats['stds'], device=data.device)
-        
-        # Get the indices of columns to normalize
-        norm_cols = ['SFN', 'Slot', 'MCS', 'ReTx']
-        indices = [columns.index(col) for col in norm_cols if col in columns]
-        
-        # Normalize only the specified columns
-        normalized_data = data.clone()
-        for i, idx in enumerate(indices):
-            normalized_data[:, idx] = (data[:, idx] - means[i]) / stds[i]
-            
-        return normalized_data
-    
     def _create_sequences(self):
         """Create sequences from all files using PyArrow and torch operations"""
         print(f"Creating sequences from {len(self.file_ids)} files...")
@@ -144,19 +120,11 @@ class AnomalySequenceDataset(Dataset):
             all_columns = table.column_names
             data_dict = {col: table[col].to_numpy() for col in all_columns}
             
-            # Create tensors for numerical and categorical features
-            numerical_data = torch.tensor(
-                np.column_stack([data_dict[col] for col in self.numerical_features]), 
-                dtype=torch.float32
-            )
-            
-            categorical_data = torch.tensor(
-                np.column_stack([data_dict[col] for col in self.categorical_features]), 
+            # Create tensors for all features (treating all as categorical)
+            feature_data = torch.tensor(
+                np.column_stack([data_dict[col] for col in self.all_features]), 
                 dtype=torch.long
             )
-            
-            # Normalize numerical data
-            numerical_data = self.normalize_data(numerical_data, self.numerical_features)
             
             # Convert insights to labels
             labels = self.insight_to_label(data_dict['insight'])
@@ -171,20 +139,18 @@ class AnomalySequenceDataset(Dataset):
             # Check if we're creating sequences for training or evaluation
             if self.is_training:
                 self._process_file_training(
-                    numerical_data, 
-                    categorical_data, 
+                    feature_data,
                     labels, 
                     data_dict['timestamp_str']
                 )
             else:
                 self._process_file_evaluation(
-                    numerical_data, 
-                    categorical_data, 
+                    feature_data,
                     labels, 
                     data_dict['timestamp_str']
                 )
     
-    def _process_file_training(self, numerical_data, categorical_data, labels, timestamps):
+    def _process_file_training(self, feature_data, labels, timestamps):
         """Process a single file to create sequences for training with anomaly-centered approach"""
         # Find anomaly indices (label != 0)
         anomaly_indices = torch.nonzero(labels != 0, as_tuple=True)[0]
@@ -198,33 +164,30 @@ class AnomalySequenceDataset(Dataset):
             start_idx = max(0, idx - (self.seq_len - 1))
             
             # Extract sequence - this includes the anomaly point
-            num_seq = numerical_data[start_idx:(idx + 1)]
-            cat_seq = categorical_data[start_idx:(idx + 1)]
+            feat_seq = feature_data[start_idx:(idx + 1)]
             seq_labels = labels[start_idx:(idx + 1)]
             
             # Extract sequence timestamps - one for each timestep
             seq_timestamps = timestamps[start_idx:(idx + 1)].tolist()
             
             # If sequence is shorter than seq_len, pad with zeros
-            if len(num_seq) < self.seq_len:
+            if len(feat_seq) < self.seq_len:
                 # Create padding tensors
-                pad_length = self.seq_len - len(num_seq)
+                pad_length = self.seq_len - len(feat_seq)
                 
-                num_padding = torch.zeros(pad_length, len(self.numerical_features), dtype=torch.float32)
-                cat_padding = torch.zeros(pad_length, len(self.categorical_features), dtype=torch.long)
+                feat_padding = torch.zeros(pad_length, len(self.all_features), dtype=torch.long)
                 label_padding = torch.zeros(pad_length, dtype=torch.long)
                 
                 # Pad timestamps with empty strings
                 timestamp_padding = [""] * pad_length
                 
                 # Combine padding with actual sequence
-                num_seq = torch.cat([num_padding, num_seq], dim=0)
-                cat_seq = torch.cat([cat_padding, cat_seq], dim=0)
+                feat_seq = torch.cat([feat_padding, feat_seq], dim=0)
                 seq_labels = torch.cat([label_padding, seq_labels], dim=0)
                 seq_timestamps = timestamp_padding + seq_timestamps
             
             # Store sequence, label and timestamp
-            self.sequences.append((num_seq, cat_seq))
+            self.sequences.append(feat_seq)
             self.labels.append(seq_labels)
             self.timestamps.append(seq_timestamps)
         
@@ -232,10 +195,10 @@ class AnomalySequenceDataset(Dataset):
         # Only create normal sequences if there are enough normal timesteps
         if len(labels) >= self.seq_len:
             self._add_normal_sequences(
-                numerical_data, categorical_data, labels, timestamps
+                feature_data, labels, timestamps
             )
 
-    def _add_normal_sequences(self, numerical_data, categorical_data, labels, timestamps):
+    def _add_normal_sequences(self, feature_data, labels, timestamps):
         """Add sequences that only consist of normal labels"""
         # Find continuous chunks of normal (label=0) points
         normal_mask = labels == 0
@@ -275,20 +238,19 @@ class AnomalySequenceDataset(Dataset):
                         chunk = chunk[start_pos:start_pos + self.seq_len]
                     
                     # Extract sequence
-                    num_seq = numerical_data[chunk]
-                    cat_seq = categorical_data[chunk]
+                    feat_seq = feature_data[chunk]
                     seq_labels = labels[chunk]
                     seq_timestamps = [timestamps[i] for i in chunk]
                     
                     # Store sequence
-                    self.sequences.append((num_seq, cat_seq))
+                    self.sequences.append(feat_seq)
                     self.labels.append(seq_labels)
                     self.timestamps.append(seq_timestamps)
 
-    def _process_file_evaluation(self, numerical_data, categorical_data, labels, timestamps):
+    def _process_file_evaluation(self, feature_data, labels, timestamps):
         """Process a single file to create non-overlapping sequences for evaluation"""
         # For evaluation, we create non-overlapping sequences covering the entire dataset
-        total_length = len(numerical_data)
+        total_length = len(feature_data)
         
         # Process full sequences
         for start_idx in range(0, total_length, self.seq_len):
@@ -305,31 +267,28 @@ class AnomalySequenceDataset(Dataset):
                     continue
             
             # Extract sequence
-            num_seq = numerical_data[start_idx:end_idx]
-            cat_seq = categorical_data[start_idx:end_idx]
+            feat_seq = feature_data[start_idx:end_idx]
             seq_labels = labels[start_idx:end_idx]
             seq_timestamps = timestamps[start_idx:end_idx].tolist()
             
             # If sequence is shorter than seq_len, pad with zeros
-            if len(num_seq) < self.seq_len:
+            if len(feat_seq) < self.seq_len:
                 # Create padding tensors
-                pad_length = self.seq_len - len(num_seq)
+                pad_length = self.seq_len - len(feat_seq)
                 
-                num_padding = torch.zeros(pad_length, len(self.numerical_features), dtype=torch.float32)
-                cat_padding = torch.zeros(pad_length, len(self.categorical_features), dtype=torch.long)
+                feat_padding = torch.zeros(pad_length, len(self.all_features), dtype=torch.long)
                 label_padding = torch.zeros(pad_length, dtype=torch.long)
                 
                 # Pad timestamps with empty strings
                 timestamp_padding = [""] * pad_length
                 
                 # Combine padding with actual sequence
-                num_seq = torch.cat([num_seq, num_padding], dim=0)  # Padding at the end for evaluation
-                cat_seq = torch.cat([cat_seq, cat_padding], dim=0)
+                feat_seq = torch.cat([feat_seq, feat_padding], dim=0)  # Padding at the end for evaluation
                 seq_labels = torch.cat([seq_labels, label_padding], dim=0)
                 seq_timestamps = seq_timestamps + timestamp_padding
             
             # Store sequence, label and timestamp
-            self.sequences.append((num_seq, cat_seq))
+            self.sequences.append(feat_seq)
             self.labels.append(seq_labels)
             self.timestamps.append(seq_timestamps)
     
@@ -337,13 +296,12 @@ class AnomalySequenceDataset(Dataset):
         return len(self.sequences)
     
     def __getitem__(self, idx):
-        numerical_data, categorical_data = self.sequences[idx]
+        feature_data = self.sequences[idx]
         labels = self.labels[idx]
         timestamps = self.timestamps[idx]  # Now a list of timestamps for each timestep
         
         return {
-            'numerical_data': numerical_data,  # Shape: [seq_len, num_features]
-            'categorical_data': categorical_data,  # Shape: [seq_len, cat_features]
+            'feature_data': feature_data,  # Shape: [seq_len, num_features]
             'label': labels,  # Shape: [seq_len]
             'timestamp': timestamps  # List of length seq_len
         }
@@ -420,11 +378,8 @@ def custom_collate_fn(batch):
     Collate function that stacks batch items without moving to device
     Device transfer should happen in the training loop after pinning
     """
-    numerical_data = torch.stack([item['numerical_data'] for item in batch])
+    feature_data = torch.stack([item['feature_data'] for item in batch])
     # Shape: [batch_size, seq_len, num_features]
-    
-    categorical_data = torch.stack([item['categorical_data'] for item in batch])
-    # Shape: [batch_size, seq_len, cat_features]
     
     labels = torch.stack([item['label'] for item in batch])
     # Shape: [batch_size, seq_len]
@@ -434,8 +389,7 @@ def custom_collate_fn(batch):
     # Shape: [batch_size, seq_len] as a list of lists of strings
     
     return {
-        'numerical_data': numerical_data,
-        'categorical_data': categorical_data,
+        'feature_data': feature_data,
         'label': labels,
         'timestamp': timestamps
     }
@@ -443,42 +397,33 @@ def custom_collate_fn(batch):
 def create_data_loaders(
     train_parquet_path='unscaled_pdsch_val.parquet', 
     test_parquet_path='unscaled_pdsch_val_min.parquet',
-    numerical_features=['SFN', 'Slot', 'MCS', 'ReTx'],
-    categorical_features=['HARQ', 'CRC', 'NDI'],
-    categorical_dims=[16, 2, 2],  # HARQ: 0-15, CRC & NDI: 0-1
+    all_features=['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI'],
+    all_feature_dims=[1024, 31, 16, 33, 2, 9, 2],
     seq_len=50,
     batch_size=64,
     num_workers=min(os.cpu_count(), 4),
     sample_fraction=1.0,
     device='cuda' if torch.cuda.is_available() else 'cpu'
 ):
-    # Load normalization statistics
-    with open('features_stats.json', 'r') as f:
-        normalization_stats = json.load(f)
-    
     # Create training dataset
     print("Creating training dataset...")
     train_dataset = AnomalySequenceDataset(
         parquet_path=train_parquet_path,
-        numerical_features=numerical_features,
-        categorical_features=categorical_features,
-        categorical_dims=categorical_dims,
+        all_features=all_features,
+        all_feature_dims=all_feature_dims,
         seq_len=seq_len,
         sample_fraction=sample_fraction,
-        normalization_stats=normalization_stats,
         device=device,
         is_training=True  # Training mode
     )
     
-    # Create test dataset with same normalization stats
+    # Create test dataset
     print("Creating test dataset...")
     test_dataset = AnomalySequenceDataset(
         parquet_path=test_parquet_path,
-        numerical_features=numerical_features,
-        categorical_features=categorical_features,
-        categorical_dims=categorical_dims,
+        all_features=all_features,
+        all_feature_dims=all_feature_dims,
         seq_len=seq_len,
-        normalization_stats=normalization_stats,
         device=device,
         is_training=False  # Evaluation mode
     )
@@ -511,7 +456,7 @@ def create_data_loaders(
         pin_memory=(device == 'cuda')
     )
     
-    return train_loader, test_loader, normalization_stats
+    return train_loader, test_loader, None
 
 
 if __name__ == "__main__":
@@ -519,9 +464,8 @@ if __name__ == "__main__":
     config = {
         'train_parquet_path': 'unscaled_pdsch_val.parquet',
         'test_parquet_path': 'unscaled_pdsch_val_min.parquet',
-        'numerical_features': ['SFN', 'Slot', 'MCS', 'ReTx'],
-        'categorical_features': ['HARQ', 'CRC', 'NDI'],
-        'categorical_dims': [16, 2, 2],  # HARQ: 0-15, CRC & NDI: 0-1
+        'all_features': ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI'],
+        'all_feature_dims': [1024, 31, 16, 33, 2, 9, 2],
         'seq_len': 20,
         'batch_size': 64,
         'num_workers': min(os.cpu_count(), 4),
@@ -529,12 +473,11 @@ if __name__ == "__main__":
     }
     
     # Create data loaders
-    train_loader, test_loader, norm_stats = create_data_loaders(
+    train_loader, test_loader, _ = create_data_loaders(
         train_parquet_path=config['train_parquet_path'],
         test_parquet_path=config['test_parquet_path'],
-        numerical_features=config['numerical_features'],
-        categorical_features=config['categorical_features'],
-        categorical_dims=config['categorical_dims'],
+        all_features=config['all_features'],
+        all_feature_dims=config['all_feature_dims'],
         seq_len=config['seq_len'],
         batch_size=config['batch_size'],
         num_workers=config['num_workers'],
