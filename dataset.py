@@ -347,30 +347,46 @@ class AnomalySequenceDataset(Dataset):
         for label, count in sorted(self.anomaly_counts.items()):
             print(f"  - {anomaly_names[label]} (label {label}): {count}")
         
-        # Calculate class weights
-        class_counts = torch.tensor([
-            zero_label_count,
-            one_label_count,
-            two_label_count,
-            three_label_count,
-            four_label_count
-        ], dtype=torch.float)
-        
-        total_samples = class_counts.sum()
-        num_classes = len(class_counts)
-        
-        class_weights = total_samples / (class_counts * num_classes)
-        class_weights[class_counts == 0] = 0.0  # Handle division by zero
-        
-        print("Class weights calculated:")
-        for i in range(num_classes):
-            if i == 0:
-                class_name = "normal"
-            else:
-                class_name = anomaly_names[i]
-            print(f"  - Class {i} ({class_name}): count={class_counts[i]}, weight={class_weights[i]:.4f}")
-        
-        self.class_weights = class_weights
+        # Only calculate and report class weights for training dataset
+        if self.is_training:
+            # Calculate multiclass weights
+            class_counts = torch.tensor([
+                zero_label_count,
+                one_label_count,
+                two_label_count,
+                three_label_count,
+                four_label_count
+            ], dtype=torch.float)
+            
+            total_samples = class_counts.sum()
+            num_classes = len(class_counts)
+            
+            class_weights = total_samples / (class_counts * num_classes)
+            class_weights[class_counts == 0] = 0.0  # Handle division by zero
+            
+            print("Multiclass weights:")
+            for i in range(num_classes):
+                if i == 0:
+                    class_name = "normal"
+                else:
+                    class_name = anomaly_names[i]
+                print(f"  - Class {i} ({class_name}): count={class_counts[i]}, weight={class_weights[i]:.4f}")
+            
+            # Calculate binary class weights (normal vs anomaly)
+            normal_count = zero_label_count
+            anomaly_count = total_samples - normal_count
+            
+            binary_counts = torch.tensor([normal_count, anomaly_count], dtype=torch.float)
+            binary_weights = total_samples / (binary_counts * 2)
+            binary_weights[binary_counts == 0] = 0.0  # Handle division by zero
+            
+            print("Binary class weights (normal vs anomaly):")
+            print(f"  - Normal (0): count={normal_count}, weight={binary_weights[0]:.4f}")
+            print(f"  - Anomaly (1): count={anomaly_count}, weight={binary_weights[1]:.4f}")
+            
+            # Store weights
+            self.class_weights = class_weights
+            self.binary_weights = binary_weights
         
 
 def custom_collate_fn(batch):

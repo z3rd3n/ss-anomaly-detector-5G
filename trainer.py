@@ -308,7 +308,7 @@ class AnomalyTypeLoss(nn.Module):
                 continue
             
             # Expected count per batch for this type
-            expected_count = self.anomaly_counts[anomaly_type] / self.num_batches
+            expected_count = self.anomaly_counts[anomaly_type]
             
             # Find positions with this anomaly type
             type_mask = (labels == anomaly_type).float()  # [batch_size, seq_len]
@@ -320,6 +320,8 @@ class AnomalyTypeLoss(nn.Module):
             # Add component to regularization loss
             # We want to maximize detected_count/expected_count, so we minimize -log(detected/expected)
             if detected_count > 0:
+                if detected_count > expected_count:
+                    print(f"Detected count ({detected_count}) > expected count ({expected_count}) for anomaly type {anomaly_type}")
                 type_loss = -torch.log((detected_count + 1e-6) / expected_count)
 
                 # Apply additional weights to anomaly types 2 and 3
