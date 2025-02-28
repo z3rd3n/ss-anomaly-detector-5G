@@ -563,21 +563,25 @@ def log_false_positives(binary_preds, binary_labels, binary_probs, feature_data,
                        timestamps_list, feature_names, epoch):
     """
     Log all false positives with their features and probabilities
+    and identify the most suspicious features
     """
     # Create flat list of all timestamps
     all_timestamps = []
     for batch_timestamps in timestamps_list:
         all_timestamps.extend([ts for sublist in batch_timestamps for ts in sublist])
     
-    # Initialize lists to store false positives
+    # Initialize lists to store false positives and true negatives (normal instances)
     fp_timestamps = []
     fp_probs = []
     fp_features = []
     
-    # Find all false positives (predicted as anomaly but actually normal)
+    # Lists to store normal instances for reference
+    normal_features = []
+    
+    # Find all false positives and collect normal instances
     for batch_idx in range(binary_preds.shape[0]):
         for seq_idx in range(binary_preds.shape[1]):
-            # Check if this is a false positive
+            # Check if this is a false positive (predicted anomaly but actually normal)
             if binary_preds[batch_idx, seq_idx] == 1 and binary_labels[batch_idx, seq_idx] == 0:
                 # Calculate flattened index to get the timestamp
                 flat_idx = batch_idx * binary_preds.shape[1] + seq_idx
@@ -592,25 +596,91 @@ def log_false_positives(binary_preds, binary_labels, binary_probs, feature_data,
                 
                 # Get the feature values
                 features = feature_data[batch_idx, seq_idx].tolist()
-                
                 fp_features.append(features)
+            
+            # Collect normal instances (true negatives)
+            elif binary_preds[batch_idx, seq_idx] == 0 and binary_labels[batch_idx, seq_idx] == 0:
+                features = feature_data[batch_idx, seq_idx].tolist()
+                normal_features.append(features)
+    
+    # Calculate reference statistics for normal data
+    normal_features_array = np.array(normal_features)
+    normal_means = np.mean(normal_features_array, axis=0)
+    normal_stds = np.std(normal_features_array, axis=0)
+    
+    def identify_suspicious_features(features, normal_means, normal_stds, feature_names, threshold=1.5):
+        """
+        Enhanced method to identify suspicious features using weighted statistical deviations
+        and domain-specific importance.
+        """
+        suspicious = []
+        
+        # Feature importance weights based on domain knowledge for 5G HARQ process
+        # Adjusted to give higher weight to more anomaly-relevant features
+        importance_weights = {
+            'SFN': 0.7,     # System Frame Number - lower relevance
+            'Slot': 0.7,    # Slot - lower relevance
+            'HARQ': 1.5,    # HARQ process ID - highly relevant for anomaly detection
+            'MCS': 1.2,     # Modulation and Coding Scheme - important for performance
+            'CRC': 2.0,     # CRC result - critical error indicator
+            'ReTx': 2.5,    # Retransmission - directly relates to anomalies
+            'NDI': 1.8      # New Data Indicator - strong indicator of protocol behavior
+        }
+        
+        # Calculate feature distributions in percentile terms
+        feature_ranks = []
+        for i, (feat, mean, std) in enumerate(zip(features, normal_means, normal_stds)):
+            feature_name = feature_names[i]
+            weight = importance_weights.get(feature_name, 1.0)
+            
+            if std > 0:  # Avoid division by zero
+                # Calculate z-score
+                z_score = abs(feat - mean) / std
+                
+                # Apply non-linear scaling to emphasize extreme values
+                scaled_score = np.tanh(z_score) * 2.0  # Tanh to cap extreme values
+                
+                # Apply feature-specific weight
+                weighted_score = scaled_score * weight
+                
+                if weighted_score > threshold:
+                    suspicious.append((feature_name, weighted_score))
+                    
+                    # Store additional info about direction of deviation (higher/lower than normal)
+                    direction = "+" if feat > mean else "-"
+                    feature_ranks.append((feature_name, weighted_score, direction))
+        
+        # Sort by weighted score (most anomalous first)
+        suspicious.sort(key=lambda x: x[1], reverse=True)
+        
+        # Format with more detailed information
+        if suspicious:
+            result = []
+            for name, score in suspicious[:3]:  # Limit to top 3 most suspicious
+                direction = "+" if features[feature_names.index(name)] > normal_means[feature_names.index(name)] else "-"
+                result.append(f"{name}{direction} ({score:.2f})")
+            return "--".join(result)
+        else:
+            return "None"
     
     # Create a dictionary to store unique false positives
     unique_fps = {}
     for ts, prob, feat in zip(fp_timestamps, fp_probs, fp_features):
         if ts not in unique_fps or prob > unique_fps[ts][0]:
-            unique_fps[ts] = (prob, feat)
+            # Identify suspicious features
+            suspicious = identify_suspicious_features(feat, normal_means, normal_stds, feature_names)
+            unique_fps[ts] = (prob, feat, suspicious)
     
     # Sort by probability in descending order
     sorted_fps = sorted(unique_fps.items(), key=lambda x: x[1][0], reverse=True)
     
     # Write to file
-    with open(f'false_positives_epoch_{epoch+1}.csv', 'w') as f:
-        f.write('timestamp,probability,' + ','.join(feature_names) + '\n')
-        for ts, (prob, feat) in sorted_fps:
-            f.write(f'{ts},{prob:.6f},' + ','.join(map(str, feat)) + '\n')
+    with open(f'false_positives.csv', 'w') as f:
+        f.write('timestamp,probability,suspicious_features,' + ','.join(feature_names) + '\n')
+        for ts, (prob, feat, suspicious) in sorted_fps:
+            f.write(f'{ts},{prob:.6f},{suspicious},' + ','.join(map(str, feat)) + '\n')
     
-    print(f"\nLogged {len(sorted_fps)} unique false positives to false_positives_epoch_{epoch+1}.csv")
+    print(f"\nLogged {len(sorted_fps)} unique false positives to false_positives.csv")
 
 def evaluate_model(
     model,
