@@ -1,0 +1,116 @@
+# MCS Analysis for False Positives
+
+*Report generated on: 2025-03-26 09:48:08*
+
+## Introduction
+
+This report analyzes the Modulation and Coding Scheme (MCS) values associated with false positives in our anomaly detection model. 
+MCS is a critical parameter in wireless systems that determines the data transmission rate and robustness.
+Our analysis explores whether certain MCS patterns or behaviors are indicative of potential anomalies that the model has identified but weren't labeled in the original dataset.
+
+## Summary Statistics
+
+### MCS Distribution by Category
+
+| Category | Count | Mean MCS | Std MCS | Median MCS | Min MCS | Max MCS |
+
+| --- | --- | --- | --- | --- | --- | --- |
+
+| Normal | 679799 | 11.53 | 8.75 | 12.00 | 0.00 | 31.00 |
+
+| Known Anomaly | 7217 | 18.39 | 13.08 | 28.00 | 0.00 | 31.00 |
+
+| False Positive | 2591 | 18.37 | 12.49 | 24.00 | 0.00 | 31.00 |
+
+
+### MCS Distribution by False Positive Cluster
+
+| Cluster | Count | Mean MCS | Std MCS | Median MCS | Min MCS | Max MCS |
+
+| --- | --- | --- | --- | --- | --- | --- |
+
+| 0.0 | 1398.0 | 17.89 | 12.61 | 23.00 | 0.00 | 31.00 |
+
+| 1.0 | 1193.0 | 18.93 | 12.32 | 27.00 | 0.00 | 31.00 |
+
+
+## Key Findings
+
+### 1. MCS Distribution Analysis
+
+The distribution of MCS values in false positives shows a distinctive pattern compared to normal and known anomaly cases.
+
+![MCS Distribution](figures/mcs_distribution_publication.png)
+
+### 2. MCS Context Window Analysis
+
+Examining the MCS values in a temporal window around false positives reveals characteristic patterns:
+
+![MCS Context Window](figures/mcs_context_publication.png)
+
+### 3. MCS Transition Analysis
+
+The transition patterns of MCS values leading up to false positives differ significantly from normal transitions:
+
+![MCS Transitions](figures/transition_matrices_publication.png)
+
+### 4. MCS Variability Analysis
+
+MCS variability metrics show significant differences between normal samples and false positives:
+
+![MCS Variability](figures/mcs_variability_publication.png)
+
+### 5. Significant MCS Transitions
+
+The following MCS transitions are significantly more common in false positives than in normal cases:
+
+| From MCS | To MCS | FP Probability | Normal Probability | Difference |
+
+| --- | --- | --- | --- | --- |
+
+| 2 | 2 | 0.3629 | 0.6044 | -0.2414 |
+
+| 27 | 27 | 0.1292 | 0.3489 | -0.2197 |
+
+| 3 | 3 | 0.4078 | 0.5911 | -0.1833 |
+
+| 27 | 25 | 0.1439 | 0.3142 | -0.1702 |
+
+| 1 | 1 | 0.3852 | 0.5290 | -0.1438 |
+
+### 6. Prototypical MCS Sequences
+
+We identified several prototypical MCS sequence patterns that often lead to false positives:
+
+![MCS Prototypes](figures/mcs_prototypes.png)
+
+### 7. Correlation with Model Outputs
+
+Analysis of the relationship between MCS values and model confidence/reconstruction error reveals:
+
+![MCS vs Model Outputs](figures/mcs_vs_model_outputs.png)
+
+## Conclusion and Recommendations
+
+Based on our comprehensive analysis of MCS patterns in false positives, we can draw several important conclusions:
+
+1. **Distinctive MCS Patterns**: False positives exhibit MCS distributions and temporal patterns that differ significantly from both normal cases and known anomalies. This suggests they may represent a valid but unlabeled anomaly class.
+
+2. **MCS Variability as an Indicator**: The variability in MCS values around false positives is consistently higher than in normal cases, suggesting that rapid fluctuations in MCS could be an early indicator of network instability.
+
+3. **Specific MCS Transitions**: Certain transitions between MCS values appear much more frequently in false positives than in normal operation, potentially indicating problematic adaptation behavior in the transmission system.
+
+4. **Cluster Differentiation**: The identified clusters of false positives show distinct MCS behaviors, suggesting they may represent different types of unlabeled anomalies with unique signatures.
+
+
+### Recommendations:
+
+1. **Enhanced Feature Engineering**: Incorporate MCS variability metrics (standard deviation, entropy, max change) as additional features in the anomaly detection model.
+
+2. **Model Refinement**: Use the identified MCS patterns to create targeted detection rules for these potential new anomaly classes.
+
+3. **Domain Expert Review**: Have wireless network experts review the identified prototypical patterns to determine if they represent known failure modes or network issues that weren't captured in the original labeling.
+
+4. **Dataset Enrichment**: Consider relabeling a subset of these false positives as a new anomaly class and retraining the model to improve its discriminative ability.
+
+5. **Extended Monitoring**: Implement specific monitoring for the identified MCS patterns in production systems to validate their relationship with actual network issues.

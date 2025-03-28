@@ -10,39 +10,349 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, precision_recall_curve, f1_score
 import os
 import json
-import logging
+import argparse
+import random
+from copy import deepcopy
 
-
-def setup_logger(log_file='anomaly_detector.log'):
+def get_default_config():
     """
-    Set up logger with file and console handlers
+    Returns default configuration parameters for the model
     """
-    # Create logger
-    logger = logging.getLogger('anomaly_detector')
-    logger.setLevel(logging.INFO)
-    
-    # Create file handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    
-    # Create formatter and add it to the handlers
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-    
-    # Add handlers to the logger
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    return logger
+    return {
+        # Data paths
+        'train_parquet_path': 'unscaled_pdsch_val.parquet',
+        'test_parquet_path': 'unscaled_pdsch_val_min.parquet',
+        
+        # Feature configuration
+        'all_features': ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI'],
+        'all_feature_dims': [1024, 31, 16, 33, 2, 9, 2],
+        
+        # Dataset parameters
+        'seq_len': 20,
+        'batch_size': 64,
+        'num_workers': 0 if torch.cuda.is_available() else min(os.cpu_count(), 4),
+        'sample_fraction': 1.0,
+        
+        # Embedding layer
+        'embedding_dim': 8,
+        'position_encoding': True,
+        
+        # GRU layer
+        'hidden_dim': 128,
+        'num_layers': 1, 
+        'bidirectional': True,
+        'gru_dropout': 0.3,
+        
+        # Attention layers
+        'attention_heads': 4,
+        'attention_dropout': 0.2,
+        
+        # Output layers
+        'classifier_hidden_dim': 64,
+        'classifier_dropout': 0.3,
+        
+        # Training parameters
+        'learning_rate': 0.001,
+        'weight_decay': 0.0001,
+        'num_epochs': 50,
+        'early_stopping_patience': 10,
+        'lr_scheduler_patience': 5, 
+        'lr_scheduler_factor': 0.5,
+        
+        # Loss weights
+        'binary_weight': 1.0,
+        'reconstruction_weight': 0.5,
+        'regularization_weight': 0.3,
+        
+        # Evaluation parameters
+        'threshold': 0.5,  # Threshold for binary classification
+        
+        # Random seed for reproducibility
+        'seed': 42,
+    }
 
-# Create logger
-logger = setup_logger()
+def parse_args():
+    """
+    Parse command line arguments and override default configuration
+    """
+    # Get default config
+    default_config = get_default_config()
+    
+    # Create parser
+    parser = argparse.ArgumentParser(description='Train and evaluate BiGRU Anomaly Detector')
+    
+    # Data paths
+    parser.add_argument('--train_path', type=str, default=default_config['train_parquet_path'],
+                        help='Path to training data parquet file')
+    parser.add_argument('--test_path', type=str, default=default_config['test_parquet_path'],
+                        help='Path to test data parquet file')
+    
+    # Dataset parameters
+    parser.add_argument('--seq_len', type=int, default=default_config['seq_len'],
+                        help='Sequence length for time series')
+    parser.add_argument('--batch_size', type=int, default=default_config['batch_size'],
+                        help='Batch size for training')
+    parser.add_argument('--sample_fraction', type=float, default=default_config['sample_fraction'],
+                        help='Fraction of data to use (0.0-1.0)')
+    
+    # Embedding layer
+    parser.add_argument('--embedding_dim', type=int, default=default_config['embedding_dim'],
+                        help='Embedding dimension size')
+    parser.add_argument('--no_position_encoding', action='store_false', dest='position_encoding',
+                        help='Disable positional encoding')
+    
+    # GRU layer
+    parser.add_argument('--hidden_dim', type=int, default=default_config['hidden_dim'],
+                        help='Hidden dimension size for GRU')
+    parser.add_argument('--num_layers', type=int, default=default_config['num_layers'],
+                        help='Number of GRU layers')
+    parser.add_argument('--no_bidirectional', action='store_false', dest='bidirectional',
+                        help='Disable bidirectional GRU')
+    parser.add_argument('--gru_dropout', type=float, default=default_config['gru_dropout'],
+                        help='Dropout rate for GRU layers')
+    
+    # Attention layers
+    parser.add_argument('--attention_heads', type=int, default=default_config['attention_heads'],
+                        help='Number of attention heads')
+    parser.add_argument('--attention_dropout', type=float, default=default_config['attention_dropout'],
+                        help='Dropout rate for attention layers')
+    
+    # Output layers
+    parser.add_argument('--classifier_hidden_dim', type=int, default=default_config['classifier_hidden_dim'],
+                        help='Hidden dimension for classifier')
+    parser.add_argument('--classifier_dropout', type=float, default=default_config['classifier_dropout'],
+                        help='Dropout rate for classifier')
+    
+    # Training parameters
+    parser.add_argument('--lr', type=float, default=default_config['learning_rate'],
+                        help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=default_config['weight_decay'],
+                        help='Weight decay for optimizer')
+    parser.add_argument('--epochs', type=int, default=default_config['num_epochs'],
+                        help='Number of training epochs')
+    parser.add_argument('--patience', type=int, default=default_config['early_stopping_patience'],
+                        help='Patience for early stopping')
+    parser.add_argument('--lr_patience', type=int, default=default_config['lr_scheduler_patience'],
+                        help='Patience for learning rate scheduler')
+    parser.add_argument('--lr_factor', type=float, default=default_config['lr_scheduler_factor'],
+                        help='Factor for learning rate scheduler')
+    
+    # Loss weights
+    parser.add_argument('--binary_weight', type=float, default=default_config['binary_weight'],
+                        help='Weight for binary classification loss')
+    parser.add_argument('--recon_weight', type=float, default=default_config['reconstruction_weight'],
+                        help='Weight for reconstruction loss')
+    parser.add_argument('--reg_weight', type=float, default=default_config['regularization_weight'],
+                        help='Weight for regularization loss')
+    
+    # Evaluation parameters
+    parser.add_argument('--threshold', type=float, default=default_config['threshold'],
+                        help='Threshold for binary classification')
+    
+    # Random seed
+    parser.add_argument('--seed', type=int, default=default_config['seed'],
+                        help='Random seed for reproducibility')
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Create config from arguments
+    config = {
+        # Data paths
+        'train_parquet_path': args.train_path,
+        'test_parquet_path': args.test_path,
+        
+        # Feature configuration (keep defaults)
+        'all_features': default_config['all_features'],
+        'all_feature_dims': default_config['all_feature_dims'],
+        
+        # Dataset parameters
+        'seq_len': args.seq_len,
+        'batch_size': args.batch_size,
+        'num_workers': default_config['num_workers'],
+        'sample_fraction': args.sample_fraction,
+        
+        # Embedding layer
+        'embedding_dim': args.embedding_dim,
+        'position_encoding': args.position_encoding,
+        
+        # GRU layer
+        'hidden_dim': args.hidden_dim,
+        'num_layers': args.num_layers,
+        'bidirectional': args.bidirectional,
+        'gru_dropout': args.gru_dropout,
+        
+        # Attention layers
+        'attention_heads': args.attention_heads,
+        'attention_dropout': args.attention_dropout,
+        
+        # Output layers
+        'classifier_hidden_dim': args.classifier_hidden_dim,
+        'classifier_dropout': args.classifier_dropout,
+        
+        # Training parameters
+        'learning_rate': args.lr,
+        'weight_decay': args.weight_decay,
+        'num_epochs': args.epochs,
+        'early_stopping_patience': args.patience,
+        'lr_scheduler_patience': args.lr_patience,
+        'lr_scheduler_factor': args.lr_factor,
+        
+        # Loss weights
+        'binary_weight': args.binary_weight,
+        'reconstruction_weight': args.recon_weight,
+        'regularization_weight': args.reg_weight,
+        
+        # Evaluation parameters
+        'threshold': args.threshold,
+        
+        # Random seed
+        'seed': args.seed,
+    }
+    
+    return config
 
+def run_hyperparameter_search(search_space, num_trials=20, strategy="random"):
+    """
+    Run hyperparameter search using random search or Bayesian optimization
+    
+    Args:
+        search_space (dict): Dictionary mapping parameter names to lists of possible values
+        num_trials (int): Number of trials to run
+        strategy (str): Search strategy - "random" or "bayesian"
+    
+    Returns:
+        best_config (dict): Best configuration found
+        best_score (float): Best score achieved
+    """
+    # Get default config
+    default_config = get_default_config()
+    
+    # Track best configuration and score
+    best_config = None
+    best_score = 0.0
+    all_trials = []
+    
+    print(f"Running hyperparameter search with {num_trials} trials using {strategy} strategy")
+    
+    if strategy == "bayesian":
+        try:
+            from skopt import Optimizer
+            from skopt.space import Real, Integer, Categorical
+            
+            # Convert search space to skopt dimensions
+            dimensions = []
+            dim_names = []
+            
+            for param, values in search_space.items():
+                if param in default_config:
+                    dim_names.append(param)
+                    
+                    # Determine type of parameter
+                    if isinstance(values[0], float):
+                        dimensions.append(Real(min(values), max(values), name=param))
+                    elif isinstance(values[0], int):
+                        dimensions.append(Integer(min(values), max(values), name=param))
+                    else:
+                        dimensions.append(Categorical(values, name=param))
+            
+            # Create optimizer
+            optimizer = Optimizer(dimensions=dimensions)
+            
+        except ImportError:
+            print("scikit-optimize not installed. Falling back to random search.")
+            strategy = "random"
+    
+    for trial in range(num_trials):
+        # Create new config for this trial
+        config = deepcopy(default_config)
+        
+        if strategy == "bayesian" and trial > 0:
+            # Use Bayesian optimization to suggest next set of parameters
+            suggested = optimizer.ask()
+            
+            # Update config with suggested parameters
+            for i, param in enumerate(dim_names):
+                config[param] = suggested[i]
+                
+        else:
+            # Randomly sample hyperparameters from search space
+            for param, values in search_space.items():
+                if param in config:
+                    if isinstance(values, list):
+                        config[param] = random.choice(values)
+                    else:
+                        # Handle ranges
+                        if isinstance(values, tuple) and len(values) == 2:
+                            min_val, max_val = values
+                            if isinstance(min_val, int) and isinstance(max_val, int):
+                                config[param] = random.randint(min_val, max_val)
+                            else:
+                                config[param] = random.uniform(min_val, max_val)
+        
+        # Set trial-specific seed to ensure reproducibility but different from other trials
+        config['seed'] = default_config['seed'] + trial
+        
+        print(f"\nTrial {trial+1}/{num_trials}")
+        print("Configuration:")
+        for param, value in config.items():
+            if param in search_space:
+                print(f"  {param}: {value}")
+        
+        # Run training with this configuration
+        score = main(config, is_hparam_search=True)
+        
+        # Track this trial
+        trial_result = {param: config[param] for param in search_space if param in config}
+        trial_result['score'] = score
+        all_trials.append(trial_result)
+        
+        print(f"Trial {trial+1} score: {score:.4f}")
+        
+        # Update best configuration if score is better
+        if score > best_score:
+            best_score = score
+            best_config = deepcopy(config)
+            print(f"New best score: {best_score:.4f}")
+            
+        # For Bayesian optimization, update with result
+        if strategy == "bayesian" and trial > 0:
+            optimizer.tell(suggested, -score)  # Negative because skopt minimizes
+    
+    # Save all trial results
+    with open('hyperparameter_search_results.json', 'w') as f:
+        json.dump(all_trials, f, indent=2)
+    
+    print("\nHyperparameter search complete")
+    print(f"Best score: {best_score:.4f}")
+    print("Best configuration:")
+    for param, value in best_config.items():
+        if param in search_space:
+            print(f"  {param}: {value}")
+    
+    return best_config, best_score
+
+class TemporalAttention(nn.Module):
+    """
+    Temporal attention mechanism to focus on important timesteps.
+    """
+    def __init__(self, hidden_dim, attention_dim=None):
+        super(TemporalAttention, self).__init__()
+        if attention_dim is None:
+            attention_dim = hidden_dim // 2
+            
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, attention_dim),
+            nn.Tanh(),
+            nn.Linear(attention_dim, 1)
+        )
+        
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, hidden_dim]
+        scores = self.attention(x)  # [batch_size, seq_len, 1]
+        attention_weights = F.softmax(scores, dim=1)  # [batch_size, seq_len, 1]
+        context_vector = torch.sum(x * attention_weights, dim=1)  # [batch_size, hidden_dim]
+        return context_vector, attention_weights
 
 class EmbeddingLayer(nn.Module):
     """
@@ -93,19 +403,8 @@ class EmbeddingLayer(nn.Module):
 class AttentionBinaryClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout, num_heads=4):
         super().__init__()
-        
-        # Make input dimension compatible with num_heads
-        if input_dim % num_heads != 0:
-            # Adjust to nearest multiple
-            adjusted_dim = ((input_dim // num_heads) + 1) * num_heads
-            self.dim_adapter = nn.Linear(input_dim, adjusted_dim)
-            self.input_dim = adjusted_dim
-        else:
-            self.dim_adapter = None
-            self.input_dim = input_dim
-        
         self.attention = nn.MultiheadAttention(
-            embed_dim=self.input_dim,
+            embed_dim=input_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True
@@ -129,12 +428,10 @@ class AttentionBinaryClassifier(nn.Module):
         
     def forward(self, x, error_per_timestep):
         # Apply self-attention
-        if self.dim_adapter is not None:
-            x = self.dim_adapter(x)
         attn_output, _ = self.attention(x, x, x)
         x = self.layer_norm1(x + attn_output)  # Residual connection
         x = self.dropout1(x)
-     
+        
         # Incorporate error per timestep
         error_expanded = error_per_timestep.unsqueeze(-1)  # [batch_size, seq_len, 1]
         combined = torch.cat([x, error_expanded], dim=-1)  # [batch_size, seq_len, input_dim+1]
@@ -206,6 +503,11 @@ class BiGRUAnomalyDetector(nn.Module):
         # Output dimension from GRU
         self.gru_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
         
+        # Temporal attention for sequence-level context
+        self.temporal_attention = TemporalAttention(
+            hidden_dim=self.gru_output_dim,
+            attention_dim=self.gru_output_dim // 2
+        )
         
         # Reconstruction layer for embedded features (for the error loss)
         self.reconstruction_layer = nn.Linear(self.gru_output_dim, self.combined_feature_dim)
@@ -228,6 +530,9 @@ class BiGRUAnomalyDetector(nn.Module):
         # Process with bidirectional GRU
         gru_output, _ = self.gru(embedded_features)
         # gru_output: [batch_size, seq_len, hidden_dim * 2] if bidirectional
+        
+        # Apply temporal attention for sequence-level context
+        context_vector, temporal_attn_weights = self.temporal_attention(gru_output)
         
         # Reconstruction of embedded features for each timestep
         feature_reconstruction = self.reconstruction_layer(gru_output)
@@ -252,7 +557,9 @@ class BiGRUAnomalyDetector(nn.Module):
             'overall_error': overall_error,
             'binary_logits': binary_logits,
             'binary_probs': binary_probs,
+            'temporal_attn_weights': temporal_attn_weights,
             'instance_attn_weights': instance_attn_weights,
+            'context_vector': context_vector
         }
     
     def count_parameters(self):
@@ -362,8 +669,7 @@ class AnomalyTypeLoss(nn.Module):
             # We want to maximize detected_count/expected_count, so we minimize -log(detected/expected)
             if detected_count > 0:
                 if detected_count > expected_count:
-                    logger.warning(f"Detected count ({detected_count}) > expected count ({expected_count}) for anomaly type {anomaly_type}")
-                    
+                    print(f"Detected count ({detected_count}) > expected count ({expected_count}) for anomaly type {anomaly_type}")
                 type_loss = -torch.log((detected_count + 1e-6) / expected_count)
 
                 # Apply additional weights to anomaly types 2 and 3
@@ -372,7 +678,7 @@ class AnomalyTypeLoss(nn.Module):
                 regularization_loss += type_loss
             
         return regularization_loss
-    
+
 def train_model(
     model,
     train_loader,
@@ -555,22 +861,22 @@ def train_model(
             binary_auc = 0.0
         
         # Display results
-        logger.info(f"\nValidation Results (Epoch {epoch+1}):")
-        logger.info(f"Overall Loss: {val_loss:.4f} (Rec: {val_rec_loss:.4f}, "
-               f"Bin: {val_binary_loss:.4f}, Reg: {val_reg_loss:.4f})")
-        logger.info(f"Binary Detection - Accuracy: {binary_acc:.4f}, F1: {binary_f1:.4f}, AUC: {binary_auc:.4f}")
+        print(f"\nValidation Results (Epoch {epoch+1}):")
+        print(f"Overall Loss: {val_loss:.4f} (Rec: {val_rec_loss:.4f}, "
+              f"Bin: {val_binary_loss:.4f}, Reg: {val_reg_loss:.4f})")
+        print(f"Binary Detection - Accuracy: {binary_acc:.4f}, F1: {binary_f1:.4f}, AUC: {binary_auc:.4f}")
         
-        # Log confusion matrices
+        # Print confusion matrices
         binary_cm = confusion_matrix(all_binary_labels_flat, all_binary_preds_flat)
-        logger.info("\nBinary Confusion Matrix (Normal vs Anomaly):")
-        logger.info("                  Predicted")
-        logger.info("                Normal  Anomaly")
-        logger.info(f"Actual Normal   {binary_cm[0][0]:<8} {binary_cm[0][1]:<8}")
-        logger.info(f"Actual Anomaly  {binary_cm[1][0]:<8} {binary_cm[1][1]:<8}")
+        print("\nBinary Confusion Matrix (Normal vs Anomaly):")
+        print("                  Predicted")
+        print("                Normal  Anomaly")
+        print(f"Actual Normal   {binary_cm[0][0]:<8} {binary_cm[0][1]:<8}")
+        print(f"Actual Anomaly  {binary_cm[1][0]:<8} {binary_cm[1][1]:<8}")
         
         # Calculate detection rate by class
         class_names = ['Norm', 'UReTx', 'MReTx', 'NoDReTx', 'MaxReTx']
-        logger.info("\nDetection Rate by Class:")
+        print("\nDetection Rate by Class:")
         for i in range(5):
             # Count total instances of this class
             class_total = np.sum(all_labels_flat == i)
@@ -583,28 +889,13 @@ def train_model(
                     class_correct = np.sum((all_binary_preds_flat == 1) & (all_labels_flat == i))
                 
                 detection_rate = class_correct / class_total
-                logger.info(f"Class {i} ({class_names[i]}): {int(class_correct)}/{int(class_total)} = {detection_rate:.2%}")
+                print(f"Class {i} ({class_names[i]}): {int(class_correct)}/{int(class_total)} = {detection_rate:.2%}")
             else:
-                logger.info(f"Class {i} ({class_names[i]}): 0/0 = 0.00%")
+                print(f"Class {i} ({class_names[i]}): 0/0 = 0.00%")
         
         # Update learning rate scheduler if provided
         if scheduler is not None:
             scheduler.step(val_loss)
-            
-        detection_rates = {
-            class_names[i]: np.sum((all_binary_preds_flat == 1) & (all_labels_flat == i)) / np.sum(all_labels_flat == i)
-            for i in range(5) if np.sum(all_labels_flat == i) > 0
-        }
-            
-        # Create the models directory if it doesn't exist
-        os.makedirs('models', exist_ok=True)
-
-        # Save the model in the models directory
-        model_filename = os.path.join('models', f"anomaly_detector_epoch_{epoch+1}_{'_'.join(f'{k}_{v:.2%}' for k, v in detection_rates.items())}.pth")
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'config': config,
-        }, model_filename)
         
         # Check for early stopping based on F1 score
         if binary_f1 > best_val_f1:
@@ -612,7 +903,7 @@ def train_model(
             early_stopping_counter = 0
             # Save the best model
             torch.save(model.state_dict(), 'best_model.pth')
-            logger.info(f"New best model saved with validation F1: {binary_f1:.4f}")
+            print(f"New best model saved with validation F1: {binary_f1:.4f}")
             
             # Update best metrics
             best_val_metrics = {
@@ -623,16 +914,16 @@ def train_model(
             }
         else:
             early_stopping_counter += 1
-            logger.info(f"Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
+            print(f"Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
             
             if early_stopping_counter >= early_stopping_patience:
-                logger.info(f"Early stopping triggered after {epoch+1} epochs")
+                print(f"Early stopping triggered after {epoch+1} epochs")
                 break
     
     # Load the best model
     model.load_state_dict(torch.load('best_model.pth'))
     
-    return model, train_losses, val_losses
+    return model, train_losses, val_losses, best_val_metrics
 
 def log_false_positives(binary_preds, binary_labels, binary_probs, feature_data, 
                        timestamps_list, feature_names, epoch):
@@ -755,7 +1046,7 @@ def log_false_positives(binary_preds, binary_labels, binary_probs, feature_data,
         for ts, (prob, feat, suspicious) in sorted_fps:
             f.write(f'{ts},{prob:.6f},{suspicious},' + ','.join(map(str, feat)) + '\n')
     
-    logger.info(f"\nLogged {len(sorted_fps)} unique false positives to false_positives_{epoch}.csv")
+    print(f"\nLogged {len(sorted_fps)} unique false positives to false_positives_{epoch}.csv")
 
 def evaluate_model(
     model,
@@ -824,16 +1115,16 @@ def evaluate_model(
     except:
         binary_auc = 0.0
     
-    logger.info("\nFinal Evaluation Results:")
-    logger.info("Binary Classification Results:")
-    logger.info(f"Accuracy: {binary_accuracy:.4f}")
-    logger.info(f"F1 Score: {binary_f1:.4f}")
-    logger.info(f"ROC AUC: {binary_auc:.4f}")
-    logger.info(f"Confusion Matrix:\n{binary_cm}")
+    print("\nFinal Evaluation Results:")
+    print("Binary Classification Results:")
+    print(f"Accuracy: {binary_accuracy:.4f}")
+    print(f"F1 Score: {binary_f1:.4f}")
+    print(f"ROC AUC: {binary_auc:.4f}")
+    print(f"Confusion Matrix:\n{binary_cm}")
     
     # Detection rate by class
     class_names = ['Normal', 'Unnecessary Retx', 'Missing Retx', 'New Data No Retx', 'Max Retx Achieved']
-    logger.info("\nDetection Rate by Class:")
+    print("\nDetection Rate by Class:")
     class_detection_rates = {}
     
     for i in range(5):
@@ -849,10 +1140,10 @@ def evaluate_model(
             
             detection_rate = class_correct / class_total
             class_detection_rates[i] = detection_rate
-            logger.info(f"Class {i} ({class_names[i]}): {int(class_correct)}/{int(class_total)} = {detection_rate:.2%}")
+            print(f"Class {i} ({class_names[i]}): {int(class_correct)}/{int(class_total)} = {detection_rate:.2%}")
         else:
             class_detection_rates[i] = 0.0
-            logger.info(f"Class {i} ({class_names[i]}): 0/0 = 0.00%")
+            print(f"Class {i} ({class_names[i]}): 0/0 = 0.00%")
     
     return {
         'binary_accuracy': binary_accuracy,
@@ -866,61 +1157,26 @@ def evaluate_model(
         'all_errors': [x.numpy() for x in all_errors]
     }
 
-
-if __name__ == "__main__":
-    # Configuration
-    config = {
-        # Data paths
-        'train_parquet_path': 'unscaled_pdsch_val.parquet',
-        'test_parquet_path': 'unscaled_pdsch_val_min.parquet',
-        
-        # Feature configuration
-        'all_features': ['SFN', 'Slot', 'HARQ', 'MCS', 'CRC', 'ReTx', 'NDI'],
-        'all_feature_dims': [1024, 31, 16, 33, 2, 9, 2],
-        
-        # Dataset parameters
-        'seq_len': 100,
-        'batch_size': 32,
-        'num_workers': 0 if torch.cuda.is_available() else min(os.cpu_count(), 4),
-        'sample_fraction': 1.0,
-        
-        # Embedding layer
-        'embedding_dim': 14,
-        'position_encoding': True,
-        
-        # GRU layer
-        'hidden_dim': 410,
-        'num_layers': 1, 
-        'bidirectional': False,
-        'gru_dropout': 0.25,
-        
-        # Attention layers
-        'attention_heads': 10,
-        'attention_dropout': 0.35,
-        
-        # Output layers
-        'classifier_hidden_dim': 38,
-        'classifier_dropout': 0.05,
-        
-        # Training parameters
-        'learning_rate': 0.001,
-        'weight_decay': 0.0001,
-        'num_epochs': 50,
-        'early_stopping_patience': 10,
-        'lr_scheduler_patience': 5, 
-        'lr_scheduler_factor': 0.5,
-        
-        # Loss weights
-        'binary_weight': 1.0,
-        'reconstruction_weight': 0.5,
-        'regularization_weight': 0.3,
-        
-        # Evaluation parameters
-        'threshold': 0.4,  # Threshold for binary classification
-        
-        # Random seed for reproducibility
-        'seed': 42,
-    }
+def main(config=None, is_hparam_search=False):
+    """
+    Main function to train and evaluate the model
+    
+    Args:
+        config (dict, optional): Configuration dictionary. If None, use default or parsed args.
+        is_hparam_search (bool): Whether this run is part of a hyperparameter search
+    
+    Returns:
+        float: F1 score on validation set (for hyperparameter search)
+    """
+    # Get configuration
+    if config is None:
+        config = parse_args()
+    
+    # Set random seed for reproducibility
+    torch.manual_seed(config['seed'])
+    np.random.seed(config['seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config['seed'])
     
     # Create data loaders
     print("Creating data loaders...")
@@ -949,6 +1205,7 @@ if __name__ == "__main__":
         position_encoding=config['position_encoding'],
         bidirectional=config['bidirectional'],
         attention_heads=config['attention_heads'],
+        attention_dropout=config['attention_dropout'],
         classifier_hidden_dim=config['classifier_hidden_dim'],
         classifier_dropout=config['classifier_dropout'],
         device=device
@@ -974,7 +1231,7 @@ if __name__ == "__main__":
     
     # Train the model
     print("Training model...")
-    model, train_losses, val_losses = train_model(
+    model, train_losses, val_losses, best_val_metrics = train_model(
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
@@ -988,6 +1245,10 @@ if __name__ == "__main__":
         regularization_weight=config['regularization_weight'],
         threshold=config['threshold']
     )
+    
+    # If this is a hyperparameter search, return the best F1 score
+    if is_hparam_search:
+        return best_val_metrics['binary_f1']
     
     # Evaluate the model
     print("Evaluating model...")
@@ -1010,12 +1271,81 @@ if __name__ == "__main__":
     plt.close()
     
     # Save model
-    model_filename = "anomaly_detector_bigru_model.pth"
-    torch.save({
+    model_filename = f"anomaly_detector_h{config['hidden_dim']}_e{config['embedding_dim']}_d{config['gru_dropout']}.pth"
+    model_results = {
         'model_state_dict': model.state_dict(),
         'config': config,
         'evaluation_results': {k: v for k, v in evaluation_results.items() 
-                              if not isinstance(v, np.ndarray) or v.size < 1000}
-    }, model_filename)
+                              if not isinstance(v, np.ndarray) and not isinstance(v, list)},
+        'best_val_metrics': best_val_metrics,
+        'train_losses': train_losses,
+        'val_losses': val_losses
+    }
+    
+    torch.save(model_results, model_filename)
     
     print(f"Model training and evaluation complete! Model saved as {model_filename}")
+    
+    return evaluation_results['binary_f1']
+
+if __name__ == "__main__":
+    import sys
+    
+    # Check if we should run hyperparameter search
+    if len(sys.argv) > 1 and sys.argv[1] == "search":
+
+        # Define expanded search space
+        search_space = {
+            # Model architecture
+            'seq_len': [10, 15, 20, 30, 40],  # Add sequence length variation
+            'hidden_dim': [64, 128, 192, 256, 384],
+            'embedding_dim': [4, 8, 12, 16, 24],
+            'num_layers': [1, 2, 3],
+            'bidirectional': [True, False],
+            'position_encoding': [True, False],
+            
+            # Attention and classifier components
+            'attention_heads': [2, 4, 8],
+            'attention_dropout': (0.1, 0.4),  # Range instead of discrete values
+            'classifier_hidden_dim': [32, 64, 96, 128, 192],
+            'classifier_dropout': (0.1, 0.5),
+            'gru_dropout': (0.1, 0.5),
+            
+            # Training parameters
+            'batch_size': [32, 64, 128, 256],
+            'learning_rate': [0.0001, 0.0003, 0.0005, 0.001, 0.003],
+            'weight_decay': [0.00001, 0.0001, 0.0005, 0.001],
+            
+            # Loss weights
+            'binary_weight': [0.5, 1.0, 1.5, 2.0, 3.0],
+            'reconstruction_weight': [0.1, 0.3, 0.5, 0.8, 1.0],
+            'regularization_weight': [0.0, 0.1, 0.3, 0.5, 0.8],
+            
+            # Evaluation threshold
+            'threshold': [0.4, 0.45, 0.5, 0.55, 0.6],
+        }
+        
+        # Number of trials to run
+        num_trials = 20
+        strategy = "bayesian"  # Default strategy
+        
+        # Parse arguments
+        if len(sys.argv) > 2:
+            try:
+                num_trials = int(sys.argv[2])
+            except ValueError:
+                pass
+                
+        if len(sys.argv) > 3:
+            if sys.argv[3] in ["random", "bayesian"]:
+                strategy = sys.argv[3]
+        
+        # Run hyperparameter search
+        best_config, _ = run_hyperparameter_search(search_space, num_trials, strategy)
+        
+        # Run final model with best configuration
+        print("\nTraining final model with best configuration...")
+        main(best_config)
+    else:
+        # Run with default or provided arguments
+        main()
